@@ -10,19 +10,19 @@ The PWM stores credentials in a local encrypted vault. It uses Argon2id to deriv
 
 ### Planned features
 
-* Initialize and manage a local vault.
-* Generate, store, retrieve, update and delete credentials.
-* Validate the master password using an encrypted vault check.
-* Encrypt credentials individually while keeping account identifiers searchable.
-* Copy retrieved passwords to the clipboard by default, with an option to display them in the terminal.
-* Clear the clipboard after 15 seconds when it has not changed.
-* Minimize sensitive data in memory and zeroize sensitive buffers after use.
+* Initialize and manage a local vault
+* Generate, store, retrieve, update and delete credentials
+* Validate the master password using an encrypted vault check
+* Encrypt credentials individually while keeping account identifiers searchable
+* Copy retrieved passwords to the clipboard by default, with an option to display them in the terminal
+* Clear the clipboard after x seconds when it has not changed
+* Minimize sensitive data in memory and zeroize sensitive buffers after use
 
 ### Out of scope
 
-* Multiple users or account registration.
-* Persistent unlocked sessions.
-* Cloud synchronization or remote storage.
+* Multiple users or account registration
+* Persistent unlocked sessions
+* Cloud synchronization or any sort of remote storage
 
 ## Planned Commands
 
@@ -41,16 +41,13 @@ The PWM stores credentials in a local encrypted vault. It uses Argon2id to deriv
 
 ### Requirements
 
-* C++ compiler with C++ support.
-* CMake.
-* libsodium for password-based key derivation and authenticated encryption.
-* A cross-platform clipboard library, such as Clip.
+An C++ compiler and CMake
 
 ### Build
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/JulianII/TalTec-SecProgram.git
+cd https://github.com/JulianII/TalTec-SecProgram.git
 
 cmake -S . -B build
 cmake --build build
@@ -58,10 +55,10 @@ cmake --build build
 
 ### Run
 
+Current state does not allow for any command execution (only an Hello World!)
+
 ```bash
-./build/pwm --init
-./build/pwm --create-pw --account "youtube"
-./build/pwm --get-pw --account "youtube"
+./build/pwm 
 ```
 
 On Windows, run the generated executable from the build directory.
