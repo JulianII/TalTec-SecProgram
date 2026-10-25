@@ -2,7 +2,6 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <algorithm>
 #include <random>
 #include <chrono>
 #include <thread>
@@ -22,11 +21,18 @@ Command parseArguments(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg.size() > 2 && arg.substr(0, 2) == "--") {
+            const std::string optionName = arg.substr(2);
+
+            if (cmd.name.empty()) {
+                cmd.name = arg;
+                continue;
+            }
+
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                cmd.options[arg.substr(2)] = argv[i + 1];
+                cmd.options[optionName] = argv[i + 1];
                 ++i;
             } else {
-                cmd.options[arg.substr(2)] = "";
+                cmd.options[optionName] = "";
             }
         } else if (arg.size() > 1 && arg[0] == '-') {
             // Short options not currently used
@@ -45,8 +51,7 @@ void printUsage() {
     std::cout << "Usage: pwm <command> [options]\n\n";
     std::cout << "Commands:\n";
     std::cout << "  --init                          Initialize a new vault and set the master password\n";
-    std::cout << "  --unlock                       Unlock the vault with master password\n";
-    std::cout << "  --lock                         Lock the vault\n";
+    std::cout << "  --uninstall                     Delete the vault and all stored credentials\n";
     std::cout << "  --create-pw --account <name>   Generate and store a password for an account\n";
     std::cout << "  --get-pw --account <name>      Retrieve a password and copy it to the clipboard\n";
     std::cout << "  --get-pw --account <name> --show-pw  Display the password in the terminal\n";
@@ -148,41 +153,35 @@ void handleInit(pwm::Vault& vault) {
     }
 }
 
-void handleUnlock(pwm::Vault& vault) {
+void handleUninstall(pwm::Vault& vault) {
     if (!vault.isInitialized()) {
-        std::cerr << "Error: Vault not initialized. Run 'pwm --init' first.\n";
+        std::cerr << "Error: No vault is initialized.\n";
         exit(1);
     }
-    
-    if (vault.isUnlocked()) {
-        std::cerr << "Vault is already unlocked.\n";
-        exit(0);
-    }
-    
-    std::cout << "Enter master password: ";
+
+    std::cout << "Enter master password to confirm vault deletion: ";
     pwm::SecureString password;
     password = platform::readHiddenPassword();
     std::cout << "\n";
-    
+
+    std::cout << "This permanently deletes the vault and all stored credentials.\n";
+    std::cout << "Type DELETE to continue: ";
+    std::string confirmation;
+    std::getline(std::cin, confirmation);
+    if (confirmation != "DELETE") {
+        std::cout << "Deletion cancelled.\n";
+        return;
+    }
+
     try {
-        vault.unlock(password.get());
+        vault.deleteVault(password.get());
         password.clear();
-        std::cout << "Vault unlocked successfully.\n";
+        std::cout << "Vault deleted successfully.\n";
     } catch (const std::exception& e) {
         password.clear();
-        std::cerr << "Error: " << e.what() << "\n";
+        std::cerr << "Error deleting vault: " << e.what() << "\n";
         exit(1);
     }
-}
-
-void handleLock(pwm::Vault& vault) {
-    if (!vault.isUnlocked()) {
-        std::cerr << "Vault is already locked.\n";
-        exit(0);
-    }
-    
-    vault.lock();
-    std::cout << "Vault locked successfully.\n";
 }
 
 void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
@@ -288,21 +287,23 @@ int main(int argc, char* argv[]) {
         handleInit(vault);
         return 0;
     }
+
+    if (cmd.name == "--uninstall") {
+        handleUninstall(vault);
+        return 0;
+    }
+
+    if (cmd.name != "--create-pw" && cmd.name != "--get-pw" &&
+        cmd.name != "--update-pw" && cmd.name != "--delete-pw") {
+        std::cerr << "Unknown command: " << cmd.name << "\n\n";
+        printUsage();
+        return 1;
+    }
     
     // All other commands require an initialized vault
     if (!vault.isInitialized()) {
         std::cerr << "Error: Vault not initialized. Run 'pwm --init' first.\n";
         return 1;
-    }
-    
-    if (cmd.name == "--unlock") {
-        handleUnlock(vault);
-        return 0;
-    }
-    
-    if (cmd.name == "--lock") {
-        handleLock(vault);
-        return 0;
     }
     
     // Check for account parameter
@@ -313,7 +314,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    std::string account = cmd.options.at("account");
+    const std::string& account = cmd.options.at("account");
     
     if (cmd.name == "--create-pw") {
         handleCreatePassword(vault, account);
@@ -340,7 +341,5 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
-    std::cerr << "Unknown command: " << cmd.name << "\n\n";
-    printUsage();
-    return 1;
+    return 0;
 }

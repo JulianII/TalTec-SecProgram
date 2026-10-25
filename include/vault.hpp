@@ -12,6 +12,7 @@ public:
     Vault();
     
     void initialize(const std::string& masterPassword);
+    void deleteVault(const std::string& masterPassword);
     bool validatePassword(const std::string& masterPassword) const;
     void unlock(const std::string& masterPassword);
     void lock();
@@ -35,12 +36,16 @@ private:
     std::string credentialsPath;
     std::vector<unsigned char> salt;
     std::vector<unsigned char> encryptedMasterKey;
+    std::vector<unsigned char> vaultKey;
     bool initialized = false;
     bool unlocked = false;
     mutable CredentialManager credentialManager;
     
     void generateSalt();
     std::vector<unsigned char> deriveKey(const std::string& password, const std::vector<unsigned char>& salt) const;
+    void generateVaultKey();
+    std::vector<unsigned char> loadVaultKey(const std::string& masterPassword) const;
+    void saveVaultKey(const std::string& masterPassword, const std::vector<unsigned char>& keyToStore) const;
     void createVaultDirectory() const;
     void loadCredentials() const;
     void saveCredentials() const;

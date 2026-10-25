@@ -16,6 +16,9 @@ struct Credential {
 
 class CredentialManager {
 public:
+    void setKey(const std::vector<unsigned char>& key);
+    void clearKey();
+
     void storeCredential(const std::string& accountName, const std::string& password);
     Credential retrieveCredential(const std::string& accountName) const;
     void updateCredential(const std::string& accountName, const std::string& newPassword);
@@ -31,8 +34,9 @@ public:
 
 private:
     std::vector<Credential> credentials;
+    std::vector<unsigned char> encryptionKey;
     
-    std::vector<unsigned char> encrypt(const std::string& plaintext) const;
+    std::vector<unsigned char> encrypt(const std::string& plaintext, const std::vector<unsigned char>& nonce) const;
     std::vector<unsigned char> generateNonce() const;
 };
 
