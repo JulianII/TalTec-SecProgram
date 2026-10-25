@@ -18,30 +18,35 @@ struct Command {
 
 Command parseArguments(int argc, char* argv[]) {
     Command cmd;
-    for (int i = 1; i < argc; ++i) {
+    if (argc < 2) {
+        return cmd;
+    }
+
+    cmd.name = argv[1];
+    if (cmd.name == "-new") {
+        cmd.name = "--create-pw";
+    } else if (cmd.name == "-get") {
+        cmd.name = "--get-pw";
+    } else if (!cmd.name.empty() && cmd.name[0] != '-') {
+        cmd.positional.push_back(cmd.name);
+        cmd.name = "--auto";
+    }
+
+    for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg.size() > 2 && arg.substr(0, 2) == "--") {
             const std::string optionName = arg.substr(2);
-
-            if (cmd.name.empty()) {
-                cmd.name = arg;
-                continue;
-            }
-
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                cmd.options[optionName] = argv[i + 1];
-                ++i;
+            if (optionName == "show-pw") {
+                cmd.options[optionName] = "";
+            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cmd.options[optionName] = argv[++i];
             } else {
                 cmd.options[optionName] = "";
             }
         } else if (arg.size() > 1 && arg[0] == '-') {
-            // Short options not currently used
+            cmd.options[arg.substr(1)] = "";
         } else {
-            if (cmd.name.empty()) {
-                cmd.name = arg;
-            } else {
-                cmd.positional.push_back(arg);
-            }
+            cmd.positional.push_back(arg);
         }
     }
     return cmd;
@@ -52,11 +57,12 @@ void printUsage() {
     std::cout << "Commands:\n";
     std::cout << "  --init                          Initialize a new vault and set the master password\n";
     std::cout << "  --uninstall                     Delete the vault and all stored credentials\n";
-    std::cout << "  --create-pw --account <name>   Generate and store a password for an account\n";
-    std::cout << "  --get-pw --account <name>      Retrieve a password and copy it to the clipboard\n";
-    std::cout << "  --get-pw --account <name> --show-pw  Display the password in the terminal\n";
-    std::cout << "  --update-pw --account <name>   Generate and store a replacement password\n";
-    std::cout << "  --delete-pw --account <name>   Delete a credential\n";
+    std::cout << "  pwm <account>                   Retrieve an existing password or create a new one\n";
+    std::cout << "  --create-pw, -new <account>    Generate and store a password for an account\n";
+    std::cout << "  --get-pw, -get <account>       Retrieve a password and copy it to the clipboard\n";
+    std::cout << "  --get-pw, -get <account> --show-pw  Display the password in the terminal\n";
+    std::cout << "  --update-pw <account>          Generate and store a replacement password\n";
+    std::cout << "  --delete-pw <account>          Delete a credential\n";
 }
 
 std::string generateRandomPassword(size_t length = 16) {
@@ -195,7 +201,13 @@ void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
     
     try {
         vault.storeCredential(account, password.get());
-        std::cout << "Password stored successfully.\n";
+        try {
+            pwm::Clipboard::copyToClipboard(password.get());
+            std::cout << "Password stored and copied to clipboard.\n";
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Password was stored, but could not be copied to clipboard: "
+                      << e.what() << "\n";
+        }
         password.clear();
     } catch (const std::exception& e) {
         password.clear();
@@ -250,7 +262,6 @@ void handleUpdatePassword(pwm::Vault& vault, const std::string& account) {
     try {
         vault.updateCredential(account, password.get());
         std::cout << "Password updated successfully.\n";
-        std::cout << "Generated password: " << password.get() << "\n";
         password.clear();
     } catch (const std::exception& e) {
         password.clear();
@@ -292,28 +303,48 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (cmd.name != "--create-pw" && cmd.name != "--get-pw" &&
+    if (cmd.name != "--auto" && cmd.name != "--create-pw" && cmd.name != "--get-pw" &&
         cmd.name != "--update-pw" && cmd.name != "--delete-pw") {
         std::cerr << "Unknown command: " << cmd.name << "\n\n";
         printUsage();
         return 1;
     }
-    
-    // All other commands require an initialized vault
+
+    if (cmd.options.find("show-pw") != cmd.options.end() &&
+        cmd.name != "--get-pw" && cmd.name != "--auto") {
+        std::cerr << "Error: --show-pw can only be used with --get-pw, -get, or the automatic account command.\n";
+        return 1;
+    }
+
+    // Each credential command operates on exactly one account.
+    if (cmd.positional.size() != 1) {
+        std::cerr << "Error: Expected exactly one account name after the command.\n";
+        return 1;
+    }
+
+    // All credential commands require an initialized vault
     if (!vault.isInitialized()) {
         std::cerr << "Error: Vault not initialized. Run 'pwm --init' first.\n";
         return 1;
     }
     
-    // Check for account parameter
-    if (cmd.options.find("account") == cmd.options.end() && 
-        (cmd.name == "--create-pw" || cmd.name == "--get-pw" || 
-         cmd.name == "--update-pw" || cmd.name == "--delete-pw")) {
-        std::cerr << "Error: Missing --account parameter.\n";
-        return 1;
+    const std::string& account = cmd.positional.front();
+
+    if (cmd.name == "--auto") {
+        if (!ensureVaultUnlocked(vault)) {
+            return 1;
+        }
+
+        if (vault.credentialExists(account)) {
+            const bool showInTerminal = cmd.options.find("show-pw") != cmd.options.end();
+            handleGetPassword(vault, account, showInTerminal);
+        } else {
+            handleCreatePassword(vault, account);
+        }
+
+        vault.lock();
+        return 0;
     }
-    
-    const std::string& account = cmd.options.at("account");
     
     if (cmd.name == "--create-pw") {
         handleCreatePassword(vault, account);

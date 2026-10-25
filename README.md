@@ -50,11 +50,12 @@ PWM is a single-user command-line password manager written in C++20 for a Secure
 | Command | Description |
 | --- | --- |
 | `pwm --init` | Create a vault and set the master password. |
-| `pwm --create-pw --account "youtube"` | Generate and store a password for an account. |
-| `pwm --get-pw --account "youtube"` | Retrieve a password and copy it to the clipboard. |
-| `pwm --get-pw --account "youtube" --show-pw` | Print the retrieved password in the terminal instead of copying it. |
-| `pwm --update-pw --account "youtube"` | Generate and store a replacement password. |
-| `pwm --delete-pw --account "youtube"` | Delete a credential. |
+| `pwm "youtube"` | Retrieve the account password if it exists; otherwise generate, store, and copy a new password to the clipboard. |
+| `pwm --create-pw "youtube"` or `pwm -new "youtube"` | Generate and store a password, then copy it to the clipboard. |
+| `pwm --get-pw "youtube"` or `pwm -get "youtube"` | Retrieve a password and copy it to the clipboard. |
+| `pwm --get-pw "youtube" --show-pw` or `pwm -get "youtube" --show-pw` | Print the retrieved password in the terminal instead of copying it. |
+| `pwm --update-pw "youtube"` | Generate and store a replacement password. |
+| `pwm --delete-pw "youtube"` | Delete a credential. |
 | `pwm --uninstall` | Permanently remove the vault after master-password and `DELETE` confirmation. |
 
 The commands above are the implemented CLI surface. Unlocking and locking are internal parts of each credential command, not separate CLI commands.
@@ -114,23 +115,37 @@ Initialize once:
 pwm --init
 ```
 
+Use the account name by itself for the automatic behavior:
+
+```text
+pwm youtube
+```
+
+PWM prompts for the master password, then retrieves the existing `youtube` password to the clipboard. If the account is not in the vault, PWM creates and stores a new password, then copies it to the clipboard. Neither path prints the password unless `--show-pw` is explicitly provided for retrieval.
+
 Create a generated password:
 
 ```text
-pwm --create-pw --account "youtube"
+pwm --create-pw "youtube"
+# Short alias:
+pwm -new "youtube"
 ```
 
 Retrieve it to the clipboard:
 
 ```text
-pwm --get-pw --account "youtube"
+pwm --get-pw "youtube"
+# Short alias:
+pwm -get "youtube"
 ```
 
 Or explicitly display it in the terminal:
 
 ```text
-pwm --get-pw --account "youtube" --show-pw
+pwm --get-pw "youtube" --show-pw
 ```
+
+`--show-pw` is an explicit opt-in that writes the retrieved password in cleartext to the terminal. Avoid it where terminal output may be recorded or visible to others.
 
 Remove the local vault:
 
