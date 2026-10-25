@@ -196,7 +196,6 @@ void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
     try {
         vault.storeCredential(account, password.get());
         std::cout << "Password stored successfully.\n";
-        std::cout << "Generated password: " << password.get() << "\n";
         password.clear();
     } catch (const std::exception& e) {
         password.clear();
