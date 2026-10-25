@@ -15,20 +15,7 @@ else()
     message(FATAL_ERROR "Unsupported operating system")
 endif()
 
-if(WIN32 AND EXISTS "C:/msys64/ucrt64/lib/libcrypto.a")
-    set(OPENSSL_ROOT_DIR "C:/msys64/ucrt64")
-    set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};C:/msys64/ucrt64")
-endif()
-
-find_package(Sodium QUIET)
-if(Sodium_FOUND)
-    message(STATUS "Found libsodium")
-    set(HAVE_SODIUM TRUE)
-else()
-    find_package(OpenSSL REQUIRED)
-    message(STATUS "Found OpenSSL")
-    set(HAVE_OPENSSL TRUE)
-endif()
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_executable(pwm
     src/main.cpp
@@ -46,10 +33,21 @@ target_include_directories(pwm PRIVATE
     include
 )
 
-if(HAVE_SODIUM)
-    target_include_directories(pwm PRIVATE ${SODIUM_INCLUDE_DIRS})
-    target_link_libraries(pwm PRIVATE ${SODIUM_LIBRARIES})
-elseif(HAVE_OPENSSL)
-    target_include_directories(pwm PRIVATE ${OPENSSL_INCLUDE_DIRS})
-    target_link_libraries(pwm PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(pwm PRIVATE OpenSSL::Crypto)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(credential_storage_tests
+        tests/credential_storage_tests.cpp
+        src/credential.cpp
+        src/vault.cpp
+    )
+    target_include_directories(credential_storage_tests PRIVATE include src)
+    target_link_libraries(credential_storage_tests PRIVATE OpenSSL::Crypto)
+    add_test(NAME credential_storage_tests COMMAND credential_storage_tests)
+
+    add_test(NAME show_password_option_rejected
+        COMMAND pwm --get-pw sample-account --show-pw
+    )
+    set_tests_properties(show_password_option_rejected PROPERTIES WILL_FAIL TRUE)
 endif()

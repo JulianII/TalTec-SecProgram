@@ -2,10 +2,9 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <random>
-#include <chrono>
-#include <thread>
+#include <utility>
 #include "vault.hpp"
+#include "crypto_random.hpp"
 #include "platform/platform.hpp"
 #include "clipboard.hpp"
 #include "secure_memory.hpp"
@@ -36,9 +35,7 @@ Command parseArguments(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg.size() > 2 && arg.substr(0, 2) == "--") {
             const std::string optionName = arg.substr(2);
-            if (optionName == "show-pw") {
-                cmd.options[optionName] = "";
-            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cmd.options[optionName] = argv[++i];
             } else {
                 cmd.options[optionName] = "";
@@ -60,37 +57,30 @@ void printUsage() {
     std::cout << "  pwm <account>                   Retrieve an existing password or create a new one\n";
     std::cout << "  --create-pw, -new <account>    Generate and store a password for an account\n";
     std::cout << "  --get-pw, -get <account>       Retrieve a password and copy it to the clipboard\n";
-    std::cout << "  --get-pw, -get <account> --show-pw  Display the password in the terminal\n";
     std::cout << "  --update-pw <account>          Generate and store a replacement password\n";
     std::cout << "  --delete-pw <account>          Delete a credential\n";
 }
 
-std::string generateRandomPassword(size_t length = 16) {
+pwm::SecureString generateRandomPassword(size_t length = 16) {
     const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, chars.size() - 1);
-    
     std::string password;
-    for (size_t i = 0; i < length; ++i) {
-        password += chars[dis(gen)];
-    }
-    return password;
-}
+    password.reserve(length);
+    const size_t acceptedByteLimit = 256 - (256 % chars.size());
+    auto random = pwm::crypto::randomBytes(length);
+    size_t randomOffset = 0;
 
-// Function to clear clipboard after a delay
-void clearClipboardAfterDelay(int seconds) {
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    // Check if clipboard still has our password
-    try {
-        std::string current = pwm::Clipboard::getClipboardText();
-        // Only clear if it's still a password (simple heuristic: non-empty and not too long)
-        if (!current.empty() && current.size() < 100) {
-            pwm::Clipboard::clearClipboard();
+    while (password.size() < length) {
+        if (randomOffset == random.size()) {
+            random = pwm::crypto::randomBytes(length - password.size());
+            randomOffset = 0;
         }
-    } catch (...) {
-        // Ignore errors
+        const unsigned char value = random[randomOffset++];
+        if (value >= acceptedByteLimit) {
+            continue;
+        }
+        password += chars[value % chars.size()];
     }
+    return pwm::SecureString(std::move(password));
 }
 
 bool ensureVaultUnlocked(pwm::Vault& vault) {
@@ -197,9 +187,8 @@ void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
     
     std::cout << "Generating password for account: " << account << "\n";
     pwm::SecureString password;
-    password = generateRandomPassword();
-    
     try {
+        password = generateRandomPassword();
         vault.storeCredential(account, password.get());
         try {
             pwm::Clipboard::copyToClipboard(password.get());
@@ -216,7 +205,7 @@ void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
     }
 }
 
-void handleGetPassword(pwm::Vault& vault, const std::string& account, bool showInTerminal) {
+void handleGetPassword(pwm::Vault& vault, const std::string& account) {
     if (!ensureVaultUnlocked(vault)) {
         exit(1);
     }
@@ -224,23 +213,11 @@ void handleGetPassword(pwm::Vault& vault, const std::string& account, bool showI
     try {
         pwm::SecureString password;
         password = vault.retrieveCredential(account);
-        
-        if (showInTerminal) {
-            std::cout << "Password for " << account << ": " << password.get() << "\n";
-        } else {
-            // Copy to clipboard
-            try {
-                pwm::Clipboard::copyToClipboard(password.get());
-                std::cout << "Password for " << account << " copied to clipboard.\n";
-                
-                // Start thread to clear clipboard after 30 seconds
-                std::thread clearThread([]() {
-                    clearClipboardAfterDelay(30);
-                });
-                clearThread.detach();
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: Could not copy to clipboard: " << e.what() << "\n";
-            }
+        try {
+            pwm::Clipboard::copyToClipboard(password.get());
+            std::cout << "Password for " << account << " copied to clipboard.\n";
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not copy password to clipboard: " << e.what() << "\n";
         }
         
         password.clear();
@@ -257,11 +234,16 @@ void handleUpdatePassword(pwm::Vault& vault, const std::string& account) {
     
     std::cout << "Generating new password for account: " << account << "\n";
     pwm::SecureString password;
-    password = generateRandomPassword();
-    
     try {
+        password = generateRandomPassword();
         vault.updateCredential(account, password.get());
-        std::cout << "Password updated successfully.\n";
+        try {
+            pwm::Clipboard::copyToClipboard(password.get());
+            std::cout << "Password updated and copied to clipboard.\n";
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Password was updated, but could not be copied to clipboard: "
+                      << e.what() << "\n";
+        }
         password.clear();
     } catch (const std::exception& e) {
         password.clear();
@@ -310,9 +292,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (cmd.options.find("show-pw") != cmd.options.end() &&
-        cmd.name != "--get-pw" && cmd.name != "--auto") {
-        std::cerr << "Error: --show-pw can only be used with --get-pw, -get, or the automatic account command.\n";
+    if (cmd.options.find("show-pw") != cmd.options.end()) {
+        std::cerr << "Error: --show-pw is not supported; passwords are never printed to the terminal.\n";
         return 1;
     }
 
@@ -336,8 +317,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (vault.credentialExists(account)) {
-            const bool showInTerminal = cmd.options.find("show-pw") != cmd.options.end();
-            handleGetPassword(vault, account, showInTerminal);
+            handleGetPassword(vault, account);
         } else {
             handleCreatePassword(vault, account);
         }
@@ -353,8 +333,7 @@ int main(int argc, char* argv[]) {
     }
     
     if (cmd.name == "--get-pw") {
-        bool showInTerminal = (cmd.options.find("show-pw") != cmd.options.end());
-        handleGetPassword(vault, account, showInTerminal);
+        handleGetPassword(vault, account);
         vault.lock();
         return 0;
     }

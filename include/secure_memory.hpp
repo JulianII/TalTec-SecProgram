@@ -51,6 +51,12 @@ public:
         data = str;
         return *this;
     }
+
+    SecureString& operator=(std::string&& str) noexcept {
+        clear();
+        data = std::move(str);
+        return *this;
+    }
     
     SecureString& operator=(const char* str) {
         clear();

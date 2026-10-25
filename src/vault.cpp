@@ -1,24 +1,139 @@
 #include "vault.hpp"
+#include "crypto_random.hpp"
 #include "platform/platform.hpp"
 #include <fstream>
 #include <filesystem>
-#include <random>
 #include <algorithm>
+#include <array>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <system_error>
 #include <openssl/evp.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
 namespace {
 
-std::vector<unsigned char> randomBytes(size_t length) {
-    std::vector<unsigned char> bytes(length);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(0, 255);
-    for (auto& byte : bytes) {
-        byte = static_cast<unsigned char>(dist(gen));
+constexpr std::array<unsigned char, 8> vaultFileMagic = {
+    'P', 'W', 'M', 'V', 'L', 'T', '0', '2'
+};
+constexpr uint32_t vaultFileVersion = 2;
+constexpr size_t vaultSaltSize = 16;
+constexpr size_t vaultNonceSize = 12;
+constexpr size_t encryptedVaultKeySize = 48;
+constexpr size_t vaultFileSize =
+    vaultFileMagic.size() + sizeof(uint32_t) + vaultSaltSize +
+    vaultNonceSize + encryptedVaultKeySize;
+constexpr std::array<unsigned char, 12> legacyVaultFileMagic = {
+    'P', 'W', 'M', '_', 'V', 'A', 'U', 'L', 'T', '_', '0', '1'
+};
+
+void appendUint32(std::vector<unsigned char>& output, uint32_t value) {
+    for (unsigned int shift = 0; shift < 32; shift += 8) {
+        output.push_back(static_cast<unsigned char>((value >> shift) & 0xff));
+    }
+}
+
+uint32_t readUint32(const std::vector<unsigned char>& input, size_t& offset) {
+    if (offset > input.size() || input.size() - offset < sizeof(uint32_t)) {
+        throw std::runtime_error("Vault file is truncated");
+    }
+    uint32_t value = 0;
+    for (unsigned int shift = 0; shift < 32; shift += 8) {
+        value |= static_cast<uint32_t>(input[offset++]) << shift;
+    }
+    return value;
+}
+
+std::string temporaryFileSuffix() {
+    constexpr char hex[] = "0123456789abcdef";
+    const auto random = pwm::crypto::randomBytes(12);
+    std::string suffix;
+    suffix.reserve(random.size() * 2);
+    for (const unsigned char byte : random) {
+        suffix.push_back(hex[byte >> 4]);
+        suffix.push_back(hex[byte & 0x0f]);
+    }
+    return suffix;
+}
+
+std::vector<unsigned char> readVaultFile(const std::string& filepath) {
+    std::error_code error;
+    const auto size = fs::file_size(filepath, error);
+    if (error) {
+        throw std::runtime_error("Could not determine vault file size: " + error.message());
+    }
+    if (size != vaultFileSize) {
+        throw std::runtime_error("Vault file has an invalid size");
+    }
+
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Vault file is missing or unreadable");
+    }
+    std::vector<unsigned char> bytes(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (file.gcount() != static_cast<std::streamsize>(bytes.size())) {
+        throw std::runtime_error("Vault file is truncated");
+    }
+    char extraByte = 0;
+    if (file.get(extraByte)) {
+        throw std::runtime_error("Vault file changed while reading");
+    }
+    if (!file.eof()) {
+        throw std::runtime_error("Could not complete reading vault file");
     }
     return bytes;
+}
+
+void writeVaultFileAtomically(
+    const std::string& filepath,
+    const std::vector<unsigned char>& bytes) {
+    const fs::path target(filepath);
+    const fs::path temporary = target.string() + "." + temporaryFileSuffix() + ".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            throw std::runtime_error("Could not create temporary vault file");
+        }
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        file.flush();
+        if (!file) {
+            file.close();
+            std::error_code ignored;
+            fs::remove(temporary, ignored);
+            throw std::runtime_error("Could not write complete vault file");
+        }
+    }
+
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto error = GetLastError();
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        throw std::system_error(static_cast<int>(error), std::system_category(),
+                                "Could not atomically replace vault file");
+    }
+#else
+    std::error_code error;
+    fs::rename(temporary, target, error);
+    if (error) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        throw std::runtime_error("Could not atomically replace vault file: " + error.message());
+    }
+#endif
 }
 
 std::vector<unsigned char> encryptWithAesGcm(
@@ -119,13 +234,15 @@ Vault::Vault() : dataDirectory(platform::getUserDataDirectory()),
                  credentialsPath(dataDirectory + "/credentials.dat") {}
 
 void Vault::generateSalt() {
-    salt.resize(16);
-    salt = randomBytes(16);
+    salt = crypto::randomBytes(16);
 }
 
 std::vector<unsigned char> Vault::deriveKey(const std::string& password, const std::vector<unsigned char>& saltBytes) const {
+    if (password.size() > static_cast<size_t>(INT_MAX)) {
+        throw std::runtime_error("Master password is too long");
+    }
     std::vector<unsigned char> key(32, 0);
-    if (PKCS5_PBKDF2_HMAC(password.c_str(), -1,
+    if (PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
         saltBytes.data(), static_cast<int>(saltBytes.size()),
         200000, EVP_sha256(), static_cast<int>(key.size()), key.data()) != 1) {
         throw std::runtime_error("Failed to derive a vault key from the master password");
@@ -134,7 +251,7 @@ std::vector<unsigned char> Vault::deriveKey(const std::string& password, const s
 }
 
 void Vault::generateVaultKey() {
-    vaultKey = randomBytes(32);
+    vaultKey = crypto::randomBytes(32);
 }
 
 void Vault::createVaultDirectory() const {
@@ -144,37 +261,42 @@ void Vault::createVaultDirectory() const {
 }
 
 std::vector<unsigned char> Vault::loadVaultKey(const std::string& masterPassword) const {
-    std::ifstream vaultFile(vaultPath, std::ios::binary);
-    if (!vaultFile) {
-        throw std::runtime_error("Vault file is missing or unreadable");
-    }
+    const auto bytes = readVaultFile(vaultPath);
+    size_t offset = 0;
+    std::vector<unsigned char> saltRead(vaultSaltSize);
+    std::vector<unsigned char> nonce(vaultNonceSize);
+    std::vector<unsigned char> encryptedKeyAndTag(encryptedVaultKeySize);
 
-    const std::vector<unsigned char> saltPrefix(16, 0);
-    const std::vector<unsigned char> expectedMagic = {'P', 'W', 'M', '_', 'V', 'A', 'U', 'L', 'T', '_', '0', '1'};
-
-    std::vector<unsigned char> saltRead(16);
-    vaultFile.read(reinterpret_cast<char*>(saltRead.data()), static_cast<std::streamsize>(saltRead.size()));
-    if (vaultFile.gcount() != static_cast<std::streamsize>(saltRead.size())) {
-        throw std::runtime_error("Vault file is truncated");
-    }
-
-    std::vector<unsigned char> nonce(12);
-    vaultFile.read(reinterpret_cast<char*>(nonce.data()), static_cast<std::streamsize>(nonce.size()));
-    if (vaultFile.gcount() != static_cast<std::streamsize>(nonce.size())) {
-        throw std::runtime_error("Vault nonce is missing");
-    }
-
-    const size_t encryptedSize = 48;
-    std::vector<unsigned char> encryptedKeyAndTag(encryptedSize);
-    vaultFile.read(reinterpret_cast<char*>(encryptedKeyAndTag.data()), static_cast<std::streamsize>(encryptedSize));
-    if (vaultFile.gcount() != static_cast<std::streamsize>(encryptedSize)) {
-        throw std::runtime_error("Encrypted vault key is incomplete");
-    }
-
-    std::vector<unsigned char> magic(12);
-    vaultFile.read(reinterpret_cast<char*>(magic.data()), static_cast<std::streamsize>(magic.size()));
-    if (vaultFile.gcount() != static_cast<std::streamsize>(magic.size()) || magic != expectedMagic) {
-        throw std::runtime_error("Vault header is invalid");
+    if (std::equal(vaultFileMagic.begin(), vaultFileMagic.end(), bytes.begin())) {
+        offset += vaultFileMagic.size();
+        if (readUint32(bytes, offset) != vaultFileVersion) {
+            throw std::runtime_error("Unsupported vault file version");
+        }
+        std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                    saltRead.size(), saltRead.begin());
+        offset += saltRead.size();
+        std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                    nonce.size(), nonce.begin());
+        offset += nonce.size();
+        std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                    encryptedKeyAndTag.size(), encryptedKeyAndTag.begin());
+        offset += encryptedKeyAndTag.size();
+        if (offset != bytes.size()) {
+            throw std::runtime_error("Vault file contains unexpected trailing data");
+        }
+    } else {
+        std::copy_n(bytes.begin(), saltRead.size(), saltRead.begin());
+        offset += saltRead.size();
+        std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                    nonce.size(), nonce.begin());
+        offset += nonce.size();
+        std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                    encryptedKeyAndTag.size(), encryptedKeyAndTag.begin());
+        offset += encryptedKeyAndTag.size();
+        if (!std::equal(legacyVaultFileMagic.begin(), legacyVaultFileMagic.end(),
+                        bytes.begin() + static_cast<std::ptrdiff_t>(offset))) {
+            throw std::runtime_error("Vault file header is invalid");
+        }
     }
 
     const auto derivedKey = deriveKey(masterPassword, saltRead);
@@ -183,21 +305,16 @@ std::vector<unsigned char> Vault::loadVaultKey(const std::string& masterPassword
 
 void Vault::saveVaultKey(const std::string& masterPassword, const std::vector<unsigned char>& keyToStore) const {
     const auto derivedKey = deriveKey(masterPassword, salt);
-    const auto nonce = randomBytes(12);
+    const auto nonce = crypto::randomBytes(12);
     std::vector<unsigned char> tag;
     const auto encryptedKeyAndTag = encryptWithAesGcm(derivedKey, keyToStore, nonce, tag);
 
-    std::ofstream vaultFile(vaultPath, std::ios::binary | std::ios::trunc);
-    if (!vaultFile) {
-        throw std::runtime_error("Could not create vault file");
-    }
-
-    vaultFile.write(reinterpret_cast<const char*>(salt.data()), static_cast<std::streamsize>(salt.size()));
-    vaultFile.write(reinterpret_cast<const char*>(nonce.data()), static_cast<std::streamsize>(nonce.size()));
-    vaultFile.write(reinterpret_cast<const char*>(encryptedKeyAndTag.data()), static_cast<std::streamsize>(encryptedKeyAndTag.size()));
-
-    const std::vector<unsigned char> magic = {'P', 'W', 'M', '_', 'V', 'A', 'U', 'L', 'T', '_', '0', '1'};
-    vaultFile.write(reinterpret_cast<const char*>(magic.data()), static_cast<std::streamsize>(magic.size()));
+    std::vector<unsigned char> bytes(vaultFileMagic.begin(), vaultFileMagic.end());
+    appendUint32(bytes, vaultFileVersion);
+    bytes.insert(bytes.end(), salt.begin(), salt.end());
+    bytes.insert(bytes.end(), nonce.begin(), nonce.end());
+    bytes.insert(bytes.end(), encryptedKeyAndTag.begin(), encryptedKeyAndTag.end());
+    writeVaultFileAtomically(vaultPath, bytes);
 }
 
 void Vault::initialize(const std::string& masterPassword) {
@@ -271,8 +388,15 @@ void Vault::unlock(const std::string& masterPassword) {
 
     vaultKey = loadVaultKey(masterPassword);
     credentialManager.setKey(vaultKey);
-    unlocked = true;
-    loadCredentials();
+    try {
+        loadCredentials();
+        unlocked = true;
+    } catch (...) {
+        credentialManager.clearKey();
+        std::fill(vaultKey.begin(), vaultKey.end(), 0);
+        vaultKey.clear();
+        throw;
+    }
 }
 
 void Vault::lock() {
@@ -288,9 +412,7 @@ void Vault::lock() {
 }
 
 void Vault::loadCredentials() const {
-    if (fs::exists(credentialsPath)) {
-        credentialManager.loadFromFile(credentialsPath);
-    }
+    credentialManager.loadFromFile(credentialsPath);
 }
 
 void Vault::saveCredentials() const {
