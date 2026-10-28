@@ -8,6 +8,6 @@ The README documents the Windows CMake, Visual Studio, vcpkg build and run proce
 
 ## Checkpoint status
 
-The core requirements are implemented. The development-environment build and CTest suite passed (2/2 tests) using MinGW and an installed OpenSSL. The documented clean-machine Visual Studio/vcpkg path has not been run in this environment. Earlier incremental commits are present, but the current Checkpoint 2 changes are not committed yet.
+The core requirements are implemented and committed in the current branch. The development-environment build and CTest suite passed (2/2 tests) using MinGW and OpenSSL 3.5.2 from MSYS2. The documented clean-machine Visual Studio/vcpkg path has not been run in this environment because Visual Studio and vcpkg are unavailable.
 
 This remains a course prototype, not a production-ready password manager. It has not received an independent security audit; account names remain visible, secure-memory clearing is best-effort, and the clipboard is outside the vault's encryption boundary. PBKDF2 is used instead of the initially planned Argon2id.

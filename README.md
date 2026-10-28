@@ -44,7 +44,7 @@ PWM is a single-user command-line password manager written in C++20 for a Secure
 | Usable interface without cleartext password output | Implemented; passwords are copied to the clipboard and not printed. |
 | Clean-machine build and run instructions | Documented below for Windows with CMake, Visual Studio, and vcpkg; this exact clean-machine setup has not been run in the development environment. |
 | Short progress note | Included in [the Checkpoint 2 progress note](./docs/checkpoint-2-progress.md). |
-| Incremental commit history | Earlier incremental commits are present. Current uncommitted changes must be committed to include this work in the history. |
+| Incremental commit history | Implemented and committed in the current branch. |
 
 ### Implementation notes and limitations
 
@@ -201,7 +201,7 @@ Important current limitations:
 2. Independently review the cryptographic design, file formats, migration path, and error handling before considering use beyond a course prototype.
 3. Improve secure-memory handling and consider clipboard expiration that is safe and reliable after the CLI process exits.
 4. Complete and validate platform support, or explicitly restrict supported platforms to Windows until Linux clipboard behavior is implemented.
-5. Verify the documented Visual Studio/vcpkg build on a clean Windows machine and commit the completed Checkpoint 2 changes.
+5. Verify the documented Visual Studio/vcpkg build on a clean Windows machine.
 
 See [the short Checkpoint 2 progress note](./docs/checkpoint-2-progress.md) for the current deliverable summary.
 
