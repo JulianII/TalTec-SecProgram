@@ -83,6 +83,18 @@ pwm::SecureString generateRandomPassword(size_t length = 16) {
     return pwm::SecureString(std::move(password));
 }
 
+bool scheduleClipboardCleanup(std::uint32_t clipboardSequenceNumber) {
+    try {
+        pwm::Clipboard::scheduleClearAfterDelay(clipboardSequenceNumber);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Password was copied, but automatic clipboard cleanup "
+                     "could not be scheduled: "
+                  << e.what() << "\n";
+        return false;
+    }
+}
+
 bool ensureVaultUnlocked(pwm::Vault& vault) {
     if (vault.isUnlocked()) {
         return true;
@@ -191,8 +203,13 @@ void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
         password = generateRandomPassword();
         vault.storeCredential(account, password.get());
         try {
-            pwm::Clipboard::copyToClipboard(password.get());
+            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
+            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
             std::cout << "Password stored and copied to clipboard.\n";
+            if (cleanupScheduled) {
+                std::cout << "Clipboard cleanup is scheduled in "
+                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
+            }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Password was stored, but could not be copied to clipboard: "
                       << e.what() << "\n";
@@ -214,8 +231,13 @@ void handleGetPassword(pwm::Vault& vault, const std::string& account) {
         pwm::SecureString password;
         password = vault.retrieveCredential(account);
         try {
-            pwm::Clipboard::copyToClipboard(password.get());
+            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
+            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
             std::cout << "Password for " << account << " copied to clipboard.\n";
+            if (cleanupScheduled) {
+                std::cout << "Clipboard cleanup is scheduled in "
+                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
+            }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Could not copy password to clipboard: " << e.what() << "\n";
         }
@@ -238,8 +260,13 @@ void handleUpdatePassword(pwm::Vault& vault, const std::string& account) {
         password = generateRandomPassword();
         vault.updateCredential(account, password.get());
         try {
-            pwm::Clipboard::copyToClipboard(password.get());
+            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
+            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
             std::cout << "Password updated and copied to clipboard.\n";
+            if (cleanupScheduled) {
+                std::cout << "Clipboard cleanup is scheduled in "
+                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
+            }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Password was updated, but could not be copied to clipboard: "
                       << e.what() << "\n";
@@ -267,6 +294,12 @@ void handleDeletePassword(pwm::Vault& vault, const std::string& account) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    if (argc == 2 && std::string(argv[1]) == "--internal-clear-clipboard") {
+        return pwm::Clipboard::runCleanupProcess();
+    }
+#endif
+
     if (argc == 1) {
         printUsage();
         return 1;

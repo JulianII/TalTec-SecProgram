@@ -12,7 +12,7 @@ PWM is a single-user command-line password manager written in C++20 for a Secure
 - Generate, store, retrieve, replace, and delete account passwords.
 - Require a master password when an operation accesses the vault.
 - Lock the vault internally after each operation; there are no persistent unlocked sessions or public `--unlock` / `--lock` commands.
-- Copy retrieved and generated passwords to the Windows clipboard; passwords are never printed to the terminal.
+- Copy retrieved and generated passwords to the Windows clipboard; passwords are never printed to the terminal. A separate helper process attempts to clear the clipboard after 15 seconds, but only if the clipboard has not changed since PWM copied the password. The helper receives no password data.
 - Keep account names searchable while encrypting password values.
 
 ### Out of scope
@@ -51,7 +51,7 @@ PWM is a single-user command-line password manager written in C++20 for a Secure
 - The current key derivation is **PBKDF2, not Argon2id**. Argon2id was part of the initial design, but has not been implemented.
 - OpenSSL's `RAND_bytes` supplies salts, keys, nonces, temporary-file names, and unbiased generated-password characters.
 - Credential storage uses a versioned format with bounded parsing, a whole-file HMAC, and atomic replacement. Account names remain visible in plaintext; the older length-prefixed file format is imported and migrated when loaded.
-- Clipboard contents remain available until another application replaces them or the user clears them. Automatic clipboard expiration is not currently implemented.
+- Clipboard cleanup is best-effort: a separate hidden process waits 15 seconds and clears the clipboard only if its sequence number has not changed since PWM copied the password. The helper receives only that sequence number, not the password. If another application changes the clipboard, its contents are preserved.
 - Secure-memory handling is partial. Standard C++ strings and vectors can make copies, and not every sensitive temporary buffer is guaranteed to be zeroized.
 - Automated persistence tests cover credential save/load, authenticated-file tampering, truncated files, legacy migration, vault reopening, vault-file tampering, and unlock failure cleanup.
 - Linux support is incomplete: terminal input and data-directory code exist, but clipboard integration is currently implemented for Windows only and the current build does not provide a Linux clipboard backend.
