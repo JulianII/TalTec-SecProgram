@@ -1,14 +1,15 @@
 #include "platform.hpp"
 
-#include <iostream>
 #include <windows.h>
 #include <shlobj.h>
+
+#include "input_validation.hpp"
 
 #include <stdexcept>
 #include <string>
 
 namespace platform {
-    std::string readHiddenPassword() {
+    pwm::SecureString readHiddenPassword() {
         HANDLE console = GetStdHandle(STD_INPUT_HANDLE);
         DWORD originalMode = 0;
 
@@ -24,17 +25,40 @@ namespace platform {
             throw std::runtime_error("Could not disable terminal echo.");
         }
 
-        std::string password = "";
-        
+        pwm::SecureString password;
+        bool restored = false;
         try {
-            std::getline(std::cin, password);
+            while (true) {
+                char character = 0;
+                DWORD charactersRead = 0;
+                if (!ReadConsoleA(console, &character, 1, &charactersRead, nullptr) ||
+                    charactersRead != 1) {
+                    throw std::runtime_error("Could not read master password from terminal.");
+                }
+                if (character == '\n' || character == '\r') {
+                    break;
+                }
+                if (password.size() == pwm::maxSecretBytes) {
+                    do {
+                        if (!ReadConsoleA(console, &character, 1,
+                                          &charactersRead, nullptr) ||
+                            charactersRead != 1) {
+                            break;
+                        }
+                    } while (character != '\n' && character != '\r');
+                    throw std::runtime_error("Password exceeds the maximum length.");
+                }
+                password.append(character);
+            }
+            if (!SetConsoleMode(console, originalMode)) {
+                throw std::runtime_error("Could not restore terminal settings.");
+            }
+            restored = true;
         } catch (...) {
-            SetConsoleMode(console, originalMode);
+            if (!restored && !SetConsoleMode(console, originalMode)) {
+                throw std::runtime_error("Could not restore terminal settings.");
+            }
             throw;
-        }
-
-        if (!SetConsoleMode(console, originalMode)) {
-            throw std::runtime_error("Could not restore terminal settings.");
         }
 
         return password;

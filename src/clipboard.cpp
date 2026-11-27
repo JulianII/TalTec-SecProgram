@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
+#include "input_validation.hpp"
 #include <windows.h>
 #include <stdexcept>
 #include <string>
@@ -12,6 +14,7 @@ namespace {
 
 constexpr DWORD clipboardRetryCount = 10;
 constexpr DWORD clipboardRetryDelayMilliseconds = 100;
+constexpr size_t maxClipboardAllocationSize = maxSecretBytes + 4096;
 
 std::runtime_error windowsError(const char* operation) {
     return std::runtime_error(
@@ -82,7 +85,13 @@ void showCleanupFailure() {
 
 } // namespace
 
-std::uint32_t Clipboard::copyToClipboard(const std::string& text) {
+std::uint32_t Clipboard::copyToClipboard(std::string_view text) {
+    if (text.size() > maxSecretBytes) {
+        throw std::runtime_error("Clipboard text exceeds the maximum supported length");
+    }
+    if (text.find('\0') != std::string_view::npos) {
+        throw std::runtime_error("Clipboard text contains a null byte");
+    }
     if (!OpenClipboard(nullptr)) {
         throw std::runtime_error("Could not open clipboard");
     }
@@ -115,13 +124,20 @@ std::uint32_t Clipboard::copyToClipboard(const std::string& text) {
     
     // Set the clipboard data
     if (!SetClipboardData(CF_TEXT, hMem)) {
+        char* failedData = static_cast<char*>(GlobalLock(hMem));
+        if (failedData) {
+            SecureZeroMemory(failedData, text.size() + 1);
+            GlobalUnlock(hMem);
+        }
         GlobalFree(hMem);
         CloseClipboard();
         throw std::runtime_error("Could not set clipboard data");
     }
 
     const std::uint32_t sequenceNumber = GetClipboardSequenceNumber();
-    CloseClipboard();
+    if (!CloseClipboard()) {
+        throw windowsError("Could not close clipboard after copying text");
+    }
     return sequenceNumber;
 }
 
@@ -252,14 +268,19 @@ int Clipboard::runCleanupProcess() {
 
 void Clipboard::clearClipboard() {
     if (!OpenClipboard(nullptr)) {
-        return; // Silently fail if we can't open clipboard
+        throw windowsError("Could not open clipboard");
     }
     
-    EmptyClipboard();
-    CloseClipboard();
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        throw windowsError("Could not clear clipboard");
+    }
+    if (!CloseClipboard()) {
+        throw windowsError("Could not close clipboard");
+    }
 }
 
-std::string Clipboard::getClipboardText() {
+SecureString Clipboard::getClipboardText() {
     if (!OpenClipboard(nullptr)) {
         throw std::runtime_error("Could not open clipboard");
     }
@@ -267,18 +288,47 @@ std::string Clipboard::getClipboardText() {
     HANDLE hData = GetClipboardData(CF_TEXT);
     if (!hData) {
         CloseClipboard();
-        return "";
+        throw std::runtime_error("Clipboard does not contain text");
     }
     
+    const SIZE_T allocationSize = GlobalSize(hData);
+    if (allocationSize == 0 || allocationSize > maxClipboardAllocationSize) {
+        CloseClipboard();
+        throw std::runtime_error("Clipboard text exceeds the maximum supported length");
+    }
+
     char* pData = static_cast<char*>(GlobalLock(hData));
     if (!pData) {
         CloseClipboard();
-        return "";
+        throw std::runtime_error("Could not access clipboard text");
     }
     
-    std::string text(pData);
+    const auto* terminator = static_cast<const char*>(
+        std::memchr(pData, '\0', allocationSize));
+    if (!terminator) {
+        GlobalUnlock(hData);
+        CloseClipboard();
+        throw std::runtime_error("Clipboard text is not terminated");
+    }
+    if (static_cast<size_t>(terminator - pData) > maxSecretBytes) {
+        GlobalUnlock(hData);
+        CloseClipboard();
+        throw std::runtime_error("Clipboard text exceeds the maximum supported length");
+    }
+
+    SecureString text;
+    try {
+        text = SecureString{std::string_view(
+            pData, static_cast<size_t>(terminator - pData))};
+    } catch (...) {
+        GlobalUnlock(hData);
+        CloseClipboard();
+        throw;
+    }
     GlobalUnlock(hData);
-    CloseClipboard();
+    if (!CloseClipboard()) {
+        throw windowsError("Could not close clipboard");
+    }
     
     return text;
 }

@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <vector>
 #include <openssl/rand.h>
+#include "secure_memory.hpp"
 
 namespace pwm::crypto {
 
@@ -14,6 +15,18 @@ inline std::vector<unsigned char> randomBytes(size_t size) {
     }
 
     std::vector<unsigned char> bytes(size);
+    if (size != 0 && RAND_bytes(bytes.data(), static_cast<int>(size)) != 1) {
+        throw std::runtime_error("Cryptographic random number generation failed");
+    }
+    return bytes;
+}
+
+inline SecureBuffer randomSecureBytes(size_t size) {
+    if (size > static_cast<size_t>(INT_MAX)) {
+        throw std::runtime_error("Requested random byte count is too large");
+    }
+
+    SecureBuffer bytes(size);
     if (size != 0 && RAND_bytes(bytes.data(), static_cast<int>(size)) != 1) {
         throw std::runtime_error("Cryptographic random number generation failed");
     }

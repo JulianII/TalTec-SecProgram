@@ -1,13 +1,20 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <map>
-#include <utility>
-#include "vault.hpp"
-#include "crypto_random.hpp"
-#include "platform/platform.hpp"
 #include "clipboard.hpp"
+#include "crypto_random.hpp"
+#include "input_validation.hpp"
+#include "platform/platform.hpp"
 #include "secure_memory.hpp"
+#include "structured_log.hpp"
+#include "vault.hpp"
+
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace {
 
 struct Command {
     std::string name;
@@ -26,24 +33,24 @@ Command parseArguments(int argc, char* argv[]) {
         cmd.name = "--create-pw";
     } else if (cmd.name == "-get") {
         cmd.name = "--get-pw";
-    } else if (!cmd.name.empty() && cmd.name[0] != '-') {
+    } else if (!cmd.name.empty() && cmd.name.front() != '-') {
         cmd.positional.push_back(cmd.name);
         cmd.name = "--auto";
     }
 
     for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg.size() > 2 && arg.substr(0, 2) == "--") {
-            const std::string optionName = arg.substr(2);
+        const std::string argument = argv[i];
+        if (argument.size() > 2 && argument.compare(0, 2, "--") == 0) {
+            const std::string optionName = argument.substr(2);
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cmd.options[optionName] = argv[++i];
             } else {
                 cmd.options[optionName] = "";
             }
-        } else if (arg.size() > 1 && arg[0] == '-') {
-            cmd.options[arg.substr(1)] = "";
+        } else if (argument.size() > 1 && argument.front() == '-') {
+            cmd.options[argument.substr(1)] = "";
         } else {
-            cmd.positional.push_back(arg);
+            cmd.positional.push_back(argument);
         }
     }
     return cmd;
@@ -62,236 +69,239 @@ void printUsage() {
 }
 
 pwm::SecureString generateRandomPassword(size_t length = 16) {
-    const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
-    std::string password;
-    password.reserve(length);
-    const size_t acceptedByteLimit = 256 - (256 % chars.size());
-    auto random = pwm::crypto::randomBytes(length);
+    constexpr std::string_view characters =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+    if (length == 0 || length > pwm::maxSecretBytes) {
+        throw std::invalid_argument("Generated password length is invalid");
+    }
+
+    pwm::SecureString password;
+    const size_t acceptedByteLimit = 256 - (256 % characters.size());
+    auto random = pwm::crypto::randomSecureBytes(length);
     size_t randomOffset = 0;
 
     while (password.size() < length) {
         if (randomOffset == random.size()) {
-            random = pwm::crypto::randomBytes(length - password.size());
+            random = pwm::crypto::randomSecureBytes(length - password.size());
             randomOffset = 0;
         }
         const unsigned char value = random[randomOffset++];
         if (value >= acceptedByteLimit) {
             continue;
         }
-        password += chars[value % chars.size()];
+        password.append(characters[value % characters.size()]);
     }
-    return pwm::SecureString(std::move(password));
+    return password;
 }
 
-bool scheduleClipboardCleanup(std::uint32_t clipboardSequenceNumber) {
+void copyPasswordToClipboard(std::string_view password) {
+    const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password);
     try {
-        pwm::Clipboard::scheduleClearAfterDelay(clipboardSequenceNumber);
-        return true;
-    } catch (const std::exception& e) {
+        pwm::Clipboard::scheduleClearAfterDelay(sequenceNumber);
+        std::cout << "Clipboard cleanup is scheduled in "
+                  << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
+        pwm::logEvent("info", "clipboard.cleanup_scheduled");
+    } catch (const std::exception& error) {
+        pwm::logEvent("warning", "clipboard.cleanup_schedule_failed");
         std::cerr << "Warning: Password was copied, but automatic clipboard cleanup "
                      "could not be scheduled: "
-                  << e.what() << "\n";
-        return false;
+                  << error.what() << "\n";
     }
 }
 
-bool ensureVaultUnlocked(pwm::Vault& vault) {
+pwm::SecureString requestMasterPassword(pwm::Vault& vault) {
     if (vault.isUnlocked()) {
-        return true;
+        throw std::logic_error("Vault is already unlocked");
     }
-    
     std::cout << "Vault is locked. Enter master password to unlock: ";
-    pwm::SecureString password;
-    password = platform::readHiddenPassword();
+    std::cout.flush();
+    auto password = platform::readHiddenPassword();
     std::cout << "\n";
-    
-    try {
-        vault.unlock(password.get());
-        password.clear();
-        return true;
-    } catch (const std::exception& e) {
-        password.clear();
-        std::cerr << "Error unlocking vault: " << e.what() << "\n";
-        return false;
-    }
+    vault.unlock(password.view());
+    pwm::logEvent("info", "vault.unlock_succeeded");
+    return password;
 }
 
 void handleInit(pwm::Vault& vault) {
     if (vault.isInitialized()) {
-        std::cerr << "Error: Vault already initialized.\n";
-        std::cerr << "Vault location: " << vault.getVaultPath() << "\n";
-        exit(1);
+        throw std::runtime_error("Vault is already initialized");
     }
-    
+
     std::cout << "Enter master password: ";
-    pwm::SecureString password;
-    password = platform::readHiddenPassword();
+    std::cout.flush();
+    auto password = platform::readHiddenPassword();
     std::cout << "\n";
-    
     std::cout << "Confirm master password: ";
-    pwm::SecureString confirm;
-    confirm = platform::readHiddenPassword();
+    std::cout.flush();
+    auto confirmation = platform::readHiddenPassword();
     std::cout << "\n";
-    
-    if (password.get() != confirm.get()) {
-        password.clear();
-        confirm.clear();
-        std::cerr << "Error: Passwords do not match.\n";
-        exit(1);
+
+    if (password.view() != confirmation.view()) {
+        throw std::invalid_argument("Master passwords do not match");
     }
-    
-    if (password.get().empty()) {
-        password.clear();
-        confirm.clear();
-        std::cerr << "Error: Password cannot be empty.\n";
-        exit(1);
-    }
-    
-    try {
-        vault.initialize(password.get());
-        password.clear();
-        confirm.clear();
-        std::cout << "Vault initialized successfully.\n";
-        std::cout << "Vault location: " << vault.getVaultPath() << "\n";
-    } catch (const std::exception& e) {
-        password.clear();
-        confirm.clear();
-        std::cerr << "Error: " << e.what() << "\n";
-        exit(1);
-    }
+    vault.initialize(password.view());
+    pwm::logEvent("info", "vault.initialized");
+    std::cout << "Vault initialized successfully.\n";
+    std::cout << "Vault location: " << vault.getVaultPath() << "\n";
 }
 
 void handleUninstall(pwm::Vault& vault) {
     if (!vault.isInitialized()) {
-        std::cerr << "Error: No vault is initialized.\n";
-        exit(1);
+        throw std::runtime_error("No vault is initialized");
     }
 
     std::cout << "Enter master password to confirm vault deletion: ";
-    pwm::SecureString password;
-    password = platform::readHiddenPassword();
+    std::cout.flush();
+    auto password = platform::readHiddenPassword();
     std::cout << "\n";
 
     std::cout << "This permanently deletes the vault and all stored credentials.\n";
     std::cout << "Type DELETE to continue: ";
+    std::cout.flush();
     std::string confirmation;
-    std::getline(std::cin, confirmation);
+    char character = 0;
+    while (std::cin.get(character) && character != '\n') {
+        if (confirmation.size() == 6) {
+            while (std::cin.get(character) && character != '\n') {}
+            throw std::invalid_argument("Deletion confirmation is too long");
+        }
+        confirmation.push_back(character);
+    }
+    if (!std::cin && !std::cin.eof()) {
+        throw std::runtime_error("Could not read deletion confirmation");
+    }
     if (confirmation != "DELETE") {
+        pwm::logEvent("info", "vault.deletion_cancelled");
         std::cout << "Deletion cancelled.\n";
         return;
     }
 
-    try {
-        vault.deleteVault(password.get());
-        password.clear();
-        std::cout << "Vault deleted successfully.\n";
-    } catch (const std::exception& e) {
-        password.clear();
-        std::cerr << "Error deleting vault: " << e.what() << "\n";
-        exit(1);
-    }
+    vault.deleteVault(password.view());
+    pwm::logEvent("info", "vault.deleted");
+    std::cout << "Vault deleted successfully.\n";
 }
 
 void handleCreatePassword(pwm::Vault& vault, const std::string& account) {
-    if (!ensureVaultUnlocked(vault)) {
-        exit(1);
-    }
-    
     std::cout << "Generating password for account: " << account << "\n";
-    pwm::SecureString password;
+    auto password = generateRandomPassword();
+    vault.storeCredential(account, password.view());
+    pwm::logEvent("info", "credential.created");
     try {
-        password = generateRandomPassword();
-        vault.storeCredential(account, password.get());
-        try {
-            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
-            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
-            std::cout << "Password stored and copied to clipboard.\n";
-            if (cleanupScheduled) {
-                std::cout << "Clipboard cleanup is scheduled in "
-                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Password was stored, but could not be copied to clipboard: "
-                      << e.what() << "\n";
-        }
-        password.clear();
-    } catch (const std::exception& e) {
-        password.clear();
-        std::cerr << "Error: " << e.what() << "\n";
-        exit(1);
+        copyPasswordToClipboard(password.view());
+        std::cout << "Password stored and copied to clipboard.\n";
+    } catch (const std::exception& error) {
+        pwm::logEvent("warning", "clipboard.copy_failed");
+        std::cerr << "Warning: Password was stored, but could not be copied to clipboard: "
+                  << error.what() << "\n";
     }
 }
 
 void handleGetPassword(pwm::Vault& vault, const std::string& account) {
-    if (!ensureVaultUnlocked(vault)) {
-        exit(1);
-    }
-    
+    auto password = vault.retrieveCredential(account);
     try {
-        pwm::SecureString password;
-        password = vault.retrieveCredential(account);
-        try {
-            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
-            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
-            std::cout << "Password for " << account << " copied to clipboard.\n";
-            if (cleanupScheduled) {
-                std::cout << "Clipboard cleanup is scheduled in "
-                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Could not copy password to clipboard: " << e.what() << "\n";
-        }
-        
-        password.clear();
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
-        exit(1);
+        copyPasswordToClipboard(password.view());
+        std::cout << "Password for " << account << " copied to clipboard.\n";
+        pwm::logEvent("info", "credential.retrieved");
+    } catch (const std::exception& error) {
+        pwm::logEvent("warning", "clipboard.copy_failed");
+        std::cerr << "Warning: Could not copy password to clipboard: "
+                  << error.what() << "\n";
     }
 }
 
 void handleUpdatePassword(pwm::Vault& vault, const std::string& account) {
-    if (!ensureVaultUnlocked(vault)) {
-        exit(1);
-    }
-    
     std::cout << "Generating new password for account: " << account << "\n";
-    pwm::SecureString password;
+    auto password = generateRandomPassword();
+    vault.updateCredential(account, password.view());
+    pwm::logEvent("info", "credential.updated");
     try {
-        password = generateRandomPassword();
-        vault.updateCredential(account, password.get());
-        try {
-            const auto sequenceNumber = pwm::Clipboard::copyToClipboard(password.get());
-            const bool cleanupScheduled = scheduleClipboardCleanup(sequenceNumber);
-            std::cout << "Password updated and copied to clipboard.\n";
-            if (cleanupScheduled) {
-                std::cout << "Clipboard cleanup is scheduled in "
-                          << pwm::Clipboard::cleanupDelaySeconds << " seconds.\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Password was updated, but could not be copied to clipboard: "
-                      << e.what() << "\n";
-        }
-        password.clear();
-    } catch (const std::exception& e) {
-        password.clear();
-        std::cerr << "Error: " << e.what() << "\n";
-        exit(1);
+        copyPasswordToClipboard(password.view());
+        std::cout << "Password updated and copied to clipboard.\n";
+    } catch (const std::exception& error) {
+        pwm::logEvent("warning", "clipboard.copy_failed");
+        std::cerr << "Warning: Password was updated, but could not be copied to clipboard: "
+                  << error.what() << "\n";
     }
 }
 
 void handleDeletePassword(pwm::Vault& vault, const std::string& account) {
-    if (!ensureVaultUnlocked(vault)) {
-        exit(1);
-    }
-    
-    try {
-        vault.deleteCredential(account);
-        std::cout << "Credential for " << account << " deleted successfully.\n";
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
-        exit(1);
-    }
+    vault.deleteCredential(account);
+    pwm::logEvent("info", "credential.deleted");
+    std::cout << "Credential for " << account << " deleted successfully.\n";
 }
+
+int runCommand(int argc, char* argv[]) {
+    if (argc == 1) {
+        printUsage();
+        return 2;
+    }
+
+    Command command = parseArguments(argc, argv);
+    if (command.options.find("show-pw") != command.options.end()) {
+        throw std::invalid_argument(
+            "--show-pw is not supported; passwords are never printed to the terminal");
+    }
+    if (!command.options.empty()) {
+        throw std::invalid_argument("Unsupported command-line option");
+    }
+
+    pwm::Vault vault;
+    if (command.name == "--init") {
+        if (!command.positional.empty()) {
+            throw std::invalid_argument("--init does not accept an account name");
+        }
+        handleInit(vault);
+        return 0;
+    }
+    if (command.name == "--uninstall") {
+        if (!command.positional.empty()) {
+            throw std::invalid_argument("--uninstall does not accept an account name");
+        }
+        handleUninstall(vault);
+        return 0;
+    }
+
+    const bool isCredentialCommand =
+        command.name == "--auto" || command.name == "--create-pw" ||
+        command.name == "--get-pw" || command.name == "--update-pw" ||
+        command.name == "--delete-pw";
+    if (!isCredentialCommand) {
+        throw std::invalid_argument("Unknown command");
+    }
+    if (command.positional.size() != 1) {
+        throw std::invalid_argument("Expected exactly one account name");
+    }
+
+    const std::string& account = command.positional.front();
+    pwm::validateAccountName(account);
+    if (!vault.isInitialized()) {
+        throw std::runtime_error("Vault not initialized. Run 'pwm --init' first");
+    }
+    if (!vault.isUnlocked()) {
+        auto masterPassword = requestMasterPassword(vault);
+    }
+
+    if (command.name == "--auto") {
+        if (vault.credentialExists(account)) {
+            handleGetPassword(vault, account);
+        } else {
+            handleCreatePassword(vault, account);
+        }
+    } else if (command.name == "--create-pw") {
+        handleCreatePassword(vault, account);
+    } else if (command.name == "--get-pw") {
+        handleGetPassword(vault, account);
+    } else if (command.name == "--update-pw") {
+        handleUpdatePassword(vault, account);
+    } else {
+        handleDeletePassword(vault, account);
+    }
+
+    vault.lock();
+    return 0;
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
@@ -300,88 +310,11 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    if (argc == 1) {
-        printUsage();
+    try {
+        return runCommand(argc, argv);
+    } catch (const std::exception& error) {
+        pwm::logEvent("error", "cli.command_failed");
+        std::cerr << "Error: " << error.what() << "\n";
         return 1;
     }
-    
-    Command cmd = parseArguments(argc, argv);
-    pwm::Vault vault;
-    
-    if (cmd.name == "--init") {
-        handleInit(vault);
-        return 0;
-    }
-
-    if (cmd.name == "--uninstall") {
-        handleUninstall(vault);
-        return 0;
-    }
-
-    if (cmd.name != "--auto" && cmd.name != "--create-pw" && cmd.name != "--get-pw" &&
-        cmd.name != "--update-pw" && cmd.name != "--delete-pw") {
-        std::cerr << "Unknown command: " << cmd.name << "\n\n";
-        printUsage();
-        return 1;
-    }
-
-    if (cmd.options.find("show-pw") != cmd.options.end()) {
-        std::cerr << "Error: --show-pw is not supported; passwords are never printed to the terminal.\n";
-        return 1;
-    }
-
-    // Each credential command operates on exactly one account.
-    if (cmd.positional.size() != 1) {
-        std::cerr << "Error: Expected exactly one account name after the command.\n";
-        return 1;
-    }
-
-    // All credential commands require an initialized vault
-    if (!vault.isInitialized()) {
-        std::cerr << "Error: Vault not initialized. Run 'pwm --init' first.\n";
-        return 1;
-    }
-    
-    const std::string& account = cmd.positional.front();
-
-    if (cmd.name == "--auto") {
-        if (!ensureVaultUnlocked(vault)) {
-            return 1;
-        }
-
-        if (vault.credentialExists(account)) {
-            handleGetPassword(vault, account);
-        } else {
-            handleCreatePassword(vault, account);
-        }
-
-        vault.lock();
-        return 0;
-    }
-    
-    if (cmd.name == "--create-pw") {
-        handleCreatePassword(vault, account);
-        vault.lock();
-        return 0;
-    }
-    
-    if (cmd.name == "--get-pw") {
-        handleGetPassword(vault, account);
-        vault.lock();
-        return 0;
-    }
-    
-    if (cmd.name == "--update-pw") {
-        handleUpdatePassword(vault, account);
-        vault.lock();
-        return 0;
-    }
-    
-    if (cmd.name == "--delete-pw") {
-        handleDeletePassword(vault, account);
-        vault.lock();
-        return 0;
-    }
-    
-    return 0;
 }

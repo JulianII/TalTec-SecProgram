@@ -1,5 +1,6 @@
 #include "credential.hpp"
 #include "crypto_random.hpp"
+#include "input_validation.hpp"
 #include "secure_memory.hpp"
 #include <fstream>
 #include <filesystem>
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <system_error>
 #include <openssl/crypto.h>
@@ -96,14 +98,14 @@ time_t readLegacyTime(const std::vector<unsigned char>& bytes, size_t& offset) {
 }
 
 std::vector<unsigned char> calculateFileMac(
-    const std::vector<unsigned char>& key,
+    const pwm::SecureBuffer& key,
     const std::vector<unsigned char>& data,
     size_t size) {
     if (key.size() != 32) {
         throw std::runtime_error("Credential file authentication key is unavailable");
     }
     static constexpr unsigned char keyLabel[] = "PWM credential file authentication key v2";
-    std::array<unsigned char, 32> authenticationKey{};
+    pwm::SecureBuffer authenticationKey(32);
     unsigned int derivedKeySize = 0;
     if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
               keyLabel, sizeof(keyLabel) - 1, authenticationKey.data(), &derivedKeySize) ||
@@ -116,10 +118,8 @@ std::vector<unsigned char> calculateFileMac(
     if (!HMAC(EVP_sha256(), authenticationKey.data(), static_cast<int>(authenticationKey.size()),
               data.data(), size, mac.data(), &macSize) ||
         macSize != authenticationTagSize) {
-        std::fill(authenticationKey.begin(), authenticationKey.end(), 0);
         throw std::runtime_error("Could not authenticate credential file");
     }
-    std::fill(authenticationKey.begin(), authenticationKey.end(), 0);
     mac.resize(macSize);
     return mac;
 }
@@ -170,6 +170,39 @@ private:
     std::vector<unsigned char>& bytes;
 };
 
+class CleanseCredentialPasswords {
+public:
+    explicit CleanseCredentialPasswords(std::vector<pwm::Credential>& records)
+        : records(records) {}
+
+    ~CleanseCredentialPasswords() {
+        for (auto& record : records) {
+            if (!record.encryptedPassword.empty()) {
+                OPENSSL_cleanse(record.encryptedPassword.data(),
+                                record.encryptedPassword.size());
+            }
+        }
+    }
+
+private:
+    std::vector<pwm::Credential>& records;
+};
+
+time_t checkedTime(uint64_t value) {
+    if (value > static_cast<uint64_t>(std::numeric_limits<time_t>::max())) {
+        throw std::runtime_error("Credential file contains an invalid timestamp");
+    }
+    return static_cast<time_t>(value);
+}
+
+void validateTimestamps(time_t createdAt, time_t updatedAt) {
+    if ((std::numeric_limits<time_t>::is_signed && createdAt < 0) ||
+        (std::numeric_limits<time_t>::is_signed && updatedAt < 0) ||
+        updatedAt < createdAt) {
+        throw std::runtime_error("Credential contains invalid timestamps");
+    }
+}
+
 void writeAtomically(const std::string& filepath, const std::vector<unsigned char>& bytes) {
     const fs::path target(filepath);
     const fs::path temporary = target.string() + "." + temporaryFileSuffix() + ".tmp";
@@ -213,7 +246,7 @@ void writeAtomically(const std::string& filepath, const std::vector<unsigned cha
 
 std::vector<pwm::Credential> parseVersion2File(
     const std::vector<unsigned char>& bytes,
-    const std::vector<unsigned char>& key) {
+    const pwm::SecureBuffer& key) {
     const size_t minimumSize = credentialFileMagic.size() + 4 + 4 + authenticationTagSize;
     if (bytes.size() < minimumSize) {
         throw std::runtime_error("Credential file is truncated");
@@ -252,6 +285,8 @@ std::vector<pwm::Credential> parseVersion2File(
         pwm::Credential cred;
         cred.accountName.assign(
             reinterpret_cast<const char*>(bytes.data() + offset), nameSize);
+        pwm::validateAccountName(
+            cred.accountName, pwm::maxPersistedAccountNameBytes);
         offset += nameSize;
         if (!accountNames.insert(cred.accountName).second) {
             throw std::runtime_error("Credential file contains duplicate account names");
@@ -273,8 +308,9 @@ std::vector<pwm::Credential> parseVersion2File(
         std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                     cred.nonce.size(), cred.nonce.begin());
         offset += cred.nonce.size();
-        cred.createdAt = static_cast<time_t>(readUint64(bytes, offset, bodySize));
-        cred.updatedAt = static_cast<time_t>(readUint64(bytes, offset, bodySize));
+        cred.createdAt = checkedTime(readUint64(bytes, offset, bodySize));
+        cred.updatedAt = checkedTime(readUint64(bytes, offset, bodySize));
+        validateTimestamps(cred.createdAt, cred.updatedAt);
         loaded.push_back(std::move(cred));
     }
 
@@ -286,6 +322,27 @@ std::vector<pwm::Credential> parseVersion2File(
 
 std::vector<pwm::Credential> parseLegacyFile(const std::vector<unsigned char>& bytes) {
     std::vector<pwm::Credential> loaded;
+    class CleanseOnFailure {
+    public:
+        explicit CleanseOnFailure(std::vector<pwm::Credential>& records)
+            : records(records) {}
+        ~CleanseOnFailure() {
+            if (active) {
+                for (auto& record : records) {
+                    if (!record.encryptedPassword.empty()) {
+                        OPENSSL_cleanse(record.encryptedPassword.data(),
+                                        record.encryptedPassword.size());
+                    }
+                }
+            }
+        }
+        void release() noexcept { active = false; }
+
+    private:
+        std::vector<pwm::Credential>& records;
+        bool active = true;
+    } cleanseOnFailure(loaded);
+
     std::set<std::string> accountNames;
     size_t offset = 0;
     while (offset < bytes.size()) {
@@ -296,7 +353,10 @@ std::vector<pwm::Credential> parseLegacyFile(const std::vector<unsigned char>& b
         }
 
         pwm::Credential cred;
+        CleanseVectorOnExit cleanseCurrent(cred.encryptedPassword);
         cred.accountName.assign(reinterpret_cast<const char*>(bytes.data() + offset), nameSize);
+        pwm::validateAccountName(
+            cred.accountName, pwm::maxPersistedAccountNameBytes);
         offset += nameSize;
         if (!accountNames.insert(cred.accountName).second) {
             throw std::runtime_error("Legacy credential file contains duplicate account names");
@@ -321,17 +381,19 @@ std::vector<pwm::Credential> parseLegacyFile(const std::vector<unsigned char>& b
         offset += nonceSize;
         cred.createdAt = readLegacyTime(bytes, offset);
         cred.updatedAt = readLegacyTime(bytes, offset);
+        validateTimestamps(cred.createdAt, cred.updatedAt);
         loaded.push_back(std::move(cred));
         if (loaded.size() > maxCredentialCount) {
             throw std::runtime_error("Legacy credential file contains too many records");
         }
     }
+    cleanseOnFailure.release();
     return loaded;
 }
 
 std::vector<unsigned char> encryptWithAesGcm(
-    const std::vector<unsigned char>& key,
-    const std::string& plaintext,
+    const pwm::SecureBuffer& key,
+    std::string_view plaintext,
     const std::vector<unsigned char>& nonce,
     std::vector<unsigned char>& tagOut) {
     if (key.size() != 32) {
@@ -378,8 +440,8 @@ std::vector<unsigned char> encryptWithAesGcm(
     }
 }
 
-std::string decryptWithAesGcm(
-    const std::vector<unsigned char>& key,
+pwm::SecureString decryptWithAesGcm(
+    const pwm::SecureBuffer& key,
     const std::vector<unsigned char>& nonce,
     const std::vector<unsigned char>& ciphertextAndTag) {
     if (key.size() != 32) {
@@ -394,7 +456,7 @@ std::string decryptWithAesGcm(
 
     std::vector<unsigned char> tag(ciphertextAndTag.end() - 16, ciphertextAndTag.end());
     std::vector<unsigned char> ciphertext(ciphertextAndTag.begin(), ciphertextAndTag.end() - 16);
-    std::vector<unsigned char> plaintext(ciphertext.size() + 16, 0);
+    pwm::SecureBuffer plaintext(ciphertext.size() + 16);
     int outLen1 = 0;
     int outLen2 = 0;
 
@@ -415,14 +477,12 @@ std::string decryptWithAesGcm(
 
         const int totalLen = outLen1 + outLen2;
         plaintext.resize(static_cast<size_t>(totalLen));
-        std::string result(plaintext.begin(), plaintext.end());
-        OPENSSL_cleanse(plaintext.data(), plaintext.size());
+        pwm::SecureString result(std::string_view(
+            reinterpret_cast<const char*>(plaintext.data()),
+            static_cast<size_t>(totalLen)));
         EVP_CIPHER_CTX_free(ctx);
         return result;
     } catch (...) {
-        if (!plaintext.empty()) {
-            OPENSSL_cleanse(plaintext.data(), plaintext.size());
-        }
         EVP_CIPHER_CTX_free(ctx);
         throw;
     }
@@ -433,21 +493,24 @@ std::string decryptWithAesGcm(
 namespace pwm {
 
 void CredentialManager::setKey(const std::vector<unsigned char>& key) {
+    encryptionKey.assign(key);
+}
+
+void CredentialManager::setKey(const SecureBuffer& key) {
     encryptionKey = key;
 }
 
 void CredentialManager::clearKey() {
-    if (!encryptionKey.empty()) {
-        std::fill(encryptionKey.begin(), encryptionKey.end(), 0);
-        encryptionKey.clear();
-    }
+    encryptionKey.clear();
 }
 
 std::vector<unsigned char> CredentialManager::generateNonce() const {
     return crypto::randomBytes(12);
 }
 
-std::vector<unsigned char> CredentialManager::encrypt(const std::string& plaintext, const std::vector<unsigned char>& nonce) const {
+std::vector<unsigned char> CredentialManager::encrypt(
+    std::string_view plaintext,
+    const std::vector<unsigned char>& nonce) const {
     if (encryptionKey.empty()) {
         throw std::runtime_error("Credential encryption key is not available");
     }
@@ -456,22 +519,30 @@ std::vector<unsigned char> CredentialManager::encrypt(const std::string& plainte
     return encryptWithAesGcm(encryptionKey, plaintext, nonce, tag);
 }
 
-std::string CredentialManager::decrypt(const std::vector<unsigned char>& ciphertext, const std::vector<unsigned char>& nonce) const {
+pwm::SecureString CredentialManager::decrypt(
+    const std::vector<unsigned char>& ciphertext,
+    const std::vector<unsigned char>& nonce) const {
     if (encryptionKey.empty()) {
         throw std::runtime_error("Credential decryption key is not available");
     }
-    return decryptWithAesGcm(encryptionKey, nonce, ciphertext);
+    auto plaintext = decryptWithAesGcm(encryptionKey, nonce, ciphertext);
+    validateSecret(plaintext.view(), "Password");
+    return plaintext;
 }
 
-void CredentialManager::storeCredential(const std::string& accountName, const std::string& password) {
+void CredentialManager::storeCredential(
+    std::string_view accountName,
+    std::string_view password) {
+    validateAccountName(accountName);
+    validateSecret(password, "Password");
     for (const auto& cred : credentials) {
         if (cred.accountName == accountName) {
-            throw std::runtime_error("Credential already exists for account: " + accountName);
+            throw std::runtime_error("Credential already exists for account");
         }
     }
 
     Credential cred;
-    cred.accountName = accountName;
+    cred.accountName.assign(accountName.data(), accountName.size());
     cred.nonce = generateNonce();
     cred.encryptedPassword = encrypt(password, cred.nonce);
     cred.createdAt = std::time(nullptr);
@@ -480,16 +551,21 @@ void CredentialManager::storeCredential(const std::string& accountName, const st
     credentials.push_back(cred);
 }
 
-Credential CredentialManager::retrieveCredential(const std::string& accountName) const {
+Credential CredentialManager::retrieveCredential(std::string_view accountName) const {
+    validateAccountName(accountName, maxPersistedAccountNameBytes);
     for (const auto& cred : credentials) {
         if (cred.accountName == accountName) {
             return cred;
         }
     }
-    throw std::runtime_error("Credential not found for account: " + accountName);
+    throw std::runtime_error("Credential not found");
 }
 
-void CredentialManager::updateCredential(const std::string& accountName, const std::string& newPassword) {
+void CredentialManager::updateCredential(
+    std::string_view accountName,
+    std::string_view newPassword) {
+    validateAccountName(accountName);
+    validateSecret(newPassword, "Password");
     for (auto& cred : credentials) {
         if (cred.accountName == accountName) {
             cred.nonce = generateNonce();
@@ -498,21 +574,23 @@ void CredentialManager::updateCredential(const std::string& accountName, const s
             return;
         }
     }
-    throw std::runtime_error("Credential not found for account: " + accountName);
+    throw std::runtime_error("Credential not found");
 }
 
-void CredentialManager::deleteCredential(const std::string& accountName) {
+void CredentialManager::deleteCredential(std::string_view accountName) {
+    validateAccountName(accountName);
     auto it = std::remove_if(credentials.begin(), credentials.end(),
         [&accountName](const Credential& cred) { return cred.accountName == accountName; });
 
     if (it == credentials.end()) {
-        throw std::runtime_error("Credential not found for account: " + accountName);
+        throw std::runtime_error("Credential not found");
     }
 
     credentials.erase(it, credentials.end());
 }
 
-bool CredentialManager::exists(const std::string& accountName) const {
+bool CredentialManager::exists(std::string_view accountName) const {
+    validateAccountName(accountName, maxPersistedAccountNameBytes);
     return std::any_of(credentials.begin(), credentials.end(),
         [&accountName](const Credential& cred) { return cred.accountName == accountName; });
 }
@@ -543,6 +621,8 @@ void CredentialManager::saveToFile(const std::string& filepath) const {
             cred.nonce.size() != 12) {
             throw std::runtime_error("Credential contains invalid data and cannot be saved");
         }
+        validateAccountName(cred.accountName, maxPersistedAccountNameBytes);
+        validateTimestamps(cred.createdAt, cred.updatedAt);
         if (!accountNames.insert(cred.accountName).second) {
             throw std::runtime_error("Duplicate account names cannot be saved");
         }
@@ -581,6 +661,7 @@ void CredentialManager::loadFromFile(const std::string& filepath) {
     std::vector<Credential> loaded = isVersion2
         ? parseVersion2File(bytes, encryptionKey)
         : parseLegacyFile(bytes);
+    CleanseCredentialPasswords cleanseLoaded(loaded);
 
     if (loaded.size() > maxCredentialCount) {
         throw std::runtime_error("Credential file contains too many records");
@@ -591,11 +672,12 @@ void CredentialManager::loadFromFile(const std::string& filepath) {
             throw std::runtime_error("Credential encryption key is unavailable for legacy migration");
         }
         for (auto& cred : loaded) {
-            pwm::SecureString legacyPassword(std::string(
-                cred.encryptedPassword.begin(), cred.encryptedPassword.end()));
+            pwm::SecureString legacyPassword(std::string_view(
+                reinterpret_cast<const char*>(cred.encryptedPassword.data()),
+                cred.encryptedPassword.size()));
             OPENSSL_cleanse(cred.encryptedPassword.data(), cred.encryptedPassword.size());
             cred.nonce = generateNonce();
-            cred.encryptedPassword = encrypt(legacyPassword.get(), cred.nonce);
+            cred.encryptedPassword = encrypt(legacyPassword.view(), cred.nonce);
         }
     }
 

@@ -1,90 +1,70 @@
 # PWM — Local Password Manager
 
-PWM is a single-user command-line password manager written in C++20 for a Secure Programming course. It is intended to keep a user's generated passwords in a local vault and require the master password for each operation that accesses stored credentials.
+PWM is a Windows-focused, single-user command-line password manager written in C++20 for a Secure Programming course.
 
-> **Project status: Checkpoint 2 core requirements implemented.** The CLI and vault workflows are implemented and tested in the development environment. The documented clean-machine Windows build has not yet been independently verified, and this project has not been security-audited. It is not ready for production use. See [Security status and limitations](#security-status-and-limitations).
+> **Checkpoint 3 status:** The CLI, vault operations, input checks, zeroizing secret storage, structured event logs, persistence tests, and draft report are implemented. The project is a course prototype, not an independently audited or production-ready password manager.
 
-## Scope
+## Features
 
-### In scope
+- Initialize a local vault and create, retrieve, replace, or delete generated account passwords.
+- Require the master password for each CLI operation that accesses the vault. The vault is locked and sensitive keys are cleared when the operation finishes.
+- Encrypt the random vault key with AES-256-GCM. Derive its wrapping key with PBKDF2-HMAC-SHA-256 (200,000 iterations) and a per-vault random salt.
+- Encrypt each stored password with AES-256-GCM and a fresh per-record nonce. Authenticate credential-file metadata with a keyed HMAC-SHA-256.
+- Serialize credentials in a versioned, bounded file format; atomically replace data files and migrate the supported legacy credential format.
+- Copy generated or retrieved passwords to the Windows clipboard. A helper process attempts to clear PWM's clipboard value after 15 seconds only if the clipboard has not changed.
+- Emit structured JSON event records to standard error. Log events contain no passwords, master passwords, account names, or secret values.
 
-- Initialize or explicitly remove a local vault.
-- Generate, store, retrieve, replace, and delete account passwords.
-- Require a master password when an operation accesses the vault.
-- Lock the vault internally after each operation; there are no persistent unlocked sessions or public `--unlock` / `--lock` commands.
-- Copy retrieved and generated passwords to the Windows clipboard; passwords are never printed to the terminal. A separate helper process attempts to clear the clipboard after 15 seconds, but only if the clipboard has not changed since PWM copied the password. The helper receives no password data.
-- Keep account names searchable while encrypting password values.
+Passwords are never printed to the terminal. The obsolete `--show-pw` option is rejected.
 
-### Out of scope
+## Input validation
 
-- Multiple users, registration, or shared vaults.
-- Persistent unlocked sessions, background services, or daemons.
-- Cloud synchronization, remote storage, or a web service.
-- Recovery of a forgotten master password. Losing it means losing access to the vault.
+Inputs are validated and rejected rather than silently trimmed or transformed:
 
-## Current implementation
+- Account names must be valid UTF-8, between 1 and 256 bytes, must not start or end with a space, and cannot contain control characters, terminal line separators, or bidirectional override controls.
+- Master passwords and stored passwords must be non-empty, no longer than 4,096 bytes, and contain no NUL byte. Password bytes are otherwise preserved exactly; PWM does not normalize or rewrite them.
+- Terminal password input is hidden and capped at 4,096 bytes. An over-limit input is drained to the end of the line and rejected.
+- Credential files have size, record-count, field-length, duplicate-name, timestamp, version, and authentication checks. Historical records can contain account names up to the file-format limit of 4,096 bytes; new names use the stricter 256-byte limit.
+- Unknown command-line options and unexpected positional arguments are rejected.
 
-### Core functionality implemented
+## Secure memory, logging, and errors
 
-- `--init` creates a local vault and prompts for a master password and confirmation.
-- Credential operations prompt for the master password, unlock the vault for that invocation, perform the operation, and lock it again.
-- The master password is used with PBKDF2-HMAC-SHA-256 (200,000 iterations) and a per-vault salt to derive a wrapping key.
-- A randomly generated 32-byte vault key is encrypted in the vault file with AES-256-GCM.
-- Each credential password is encrypted with AES-256-GCM and a per-record nonce. The authentication tag is stored with the ciphertext and checked during decryption.
-- `--uninstall` requires the master password and the literal confirmation `DELETE` before removing the vault files.
-- The build uses CMake and C++20.
+`SecureString` and `SecureBuffer` use zeroizing allocators. Their active contents are cleansed when cleared, and allocated storage is cleansed again before deallocation. They are used for hidden terminal input, generated and decrypted passwords, the vault key, derived keys, and the credential-file authentication key. Password APIs use non-owning views to avoid making additional standard-string copies. Temporary legacy plaintext is cleansed during migration, including error paths.
 
-### Checkpoint 2 deliverables
+This is best-effort process-memory protection, not a guarantee against operating-system or hardware-level capture. Secret pages are not locked against paging; crash dumps, hibernation, debuggers, OpenSSL internals, and caller-owned input buffers are outside the zeroizing containers. The clipboard is outside the vault's memory boundary and may be read by other applications. Automatic clipboard clearing is best effort.
 
-| Requirement | Status |
-| --- | --- |
-| Basic vault storage | Implemented; vaults and credentials persist locally and can be reopened. |
-| Credentials encrypted at rest | Implemented with AES-256-GCM; credential records also have a whole-file HMAC. |
-| Master-password authentication | Implemented; a wrong password prevents unlocking. |
-| Usable interface without cleartext password output | Implemented; passwords are copied to the clipboard and not printed. |
-| Clean-machine build and run instructions | Documented below for Windows with CMake, Visual Studio, and vcpkg; this exact clean-machine setup has not been run in the development environment. |
-| Short progress note | Included in [the Checkpoint 2 progress note](./docs/checkpoint-2-progress.md). |
-| Incremental commit history | Implemented and committed in the current branch. |
+Operational events are emitted as one JSON object per line, for example:
 
-### Implementation notes and limitations
+```json
+{"timestamp":"2026-11-27T08:00:00Z","level":"info","event":"credential.created"}
+```
 
-- The current key derivation is **PBKDF2, not Argon2id**. Argon2id was part of the initial design, but has not been implemented.
-- OpenSSL's `RAND_bytes` supplies salts, keys, nonces, temporary-file names, and unbiased generated-password characters.
-- Credential storage uses a versioned format with bounded parsing, a whole-file HMAC, and atomic replacement. Account names remain visible in plaintext; the older length-prefixed file format is imported and migrated when loaded.
-- Clipboard cleanup is best-effort: a separate hidden process waits 15 seconds and clears the clipboard only if its sequence number has not changed since PWM copied the password. The helper receives only that sequence number, not the password. If another application changes the clipboard, its contents are preserved.
-- Secure-memory handling is partial. Standard C++ strings and vectors can make copies, and not every sensitive temporary buffer is guaranteed to be zeroized.
-- Automated persistence tests cover credential save/load, authenticated-file tampering, truncated files, legacy migration, vault reopening, vault-file tampering, and unlock failure cleanup.
-- Linux support is incomplete: terminal input and data-directory code exist, but clipboard integration is currently implemented for Windows only and the current build does not provide a Linux clipboard backend.
-- The uninstall operation removes vault files; it does not securely overwrite storage. Filesystem, SSD, backup, and journal behavior can retain recoverable data.
+Events use fixed names and do not include user-controlled values or secrets. Errors are reported to the user and produce a generic structured failure event; error details are not copied into logs.
+
+## Per-user storage and access
+
+PWM is installed and run for one Windows user. Its files are stored under that user's `%LOCALAPPDATA%\pwm` directory and use the Windows profile's inherited access-control list. Each CLI credential operation also requires the master password before using the vault. Vault record methods reject calls while locked.
+
+This is an OS-profile boundary, not a multi-user application authorization system. PWM does not define separate users, roles, or shared-vault ownership. Anyone who can access the same Windows account and its profile can access that account's files; administrators and malware running with equivalent privileges are outside this boundary. Do not weaken the directory's Windows ACL.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `pwm --init` | Create a vault and set the master password. |
-| `pwm "youtube"` | Retrieve the account password if it exists; otherwise generate, store, and copy a new password to the clipboard. |
-| `pwm --create-pw "youtube"` or `pwm -new "youtube"` | Generate and store a password, then copy it to the clipboard. |
-| `pwm --get-pw "youtube"` or `pwm -get "youtube"` | Retrieve a password and copy it to the clipboard. |
+| `pwm --init` | Create the vault and set/confirm the master password. |
+| `pwm "youtube"` | Retrieve the existing password, or create one if the account is new. |
+| `pwm --create-pw "youtube"` or `pwm -new "youtube"` | Generate and store a password. |
+| `pwm --get-pw "youtube"` or `pwm -get "youtube"` | Retrieve a password. |
 | `pwm --update-pw "youtube"` | Generate and store a replacement password. |
 | `pwm --delete-pw "youtube"` | Delete a credential. |
-| `pwm --uninstall` | Permanently remove the vault after master-password and `DELETE` confirmation. |
+| `pwm --uninstall` | Verify the master password and require typing `DELETE` before removing vault files. |
 
-The commands above are the implemented CLI surface. Unlocking and locking are internal parts of each credential command, not separate CLI commands.
-The `--show-pw` option is rejected; PWM never prints passwords in cleartext.
+Unlocking and locking are internal to each credential command. There are no persistent unlocked sessions or public `--unlock` / `--lock` commands. File removal is not secure disk erasure.
 
-## Build
+## Build on Windows
 
-### Requirements
+Requirements: CMake 3.20+, a C++20 compiler (Visual Studio 2022 or Build Tools with the C++ workload), and OpenSSL Crypto. The vcpkg manifest declares OpenSSL.
 
-- CMake 3.20 or newer.
-- A C++20 compiler.
-- OpenSSL development headers and libraries (the implementation uses OpenSSL Crypto APIs).
-
-The project requires OpenSSL Crypto; CMake locates it with `find_package(OpenSSL REQUIRED COMPONENTS Crypto)`. The repository includes a vcpkg manifest declaring OpenSSL.
-
-### Windows (PowerShell)
-
-Install Git, CMake, and Visual Studio 2022 (or Build Tools with the C++ workload). Install and bootstrap vcpkg, then set `VCPKG_ROOT` to its installation directory. For example, from PowerShell:
+Install and bootstrap vcpkg, then set its location:
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg C:\vcpkg
@@ -92,7 +72,7 @@ git clone https://github.com/microsoft/vcpkg C:\vcpkg
 $env:VCPKG_ROOT = "C:\vcpkg"
 ```
 
-Clone this project and configure it from a PowerShell session:
+Configure, build, and test:
 
 ```powershell
 git clone https://github.com/JulianII/TalTec-SecProgram.git
@@ -102,118 +82,58 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-In manifest mode, vcpkg installs the declared OpenSSL dependency during CMake configuration. If OpenSSL is already installed outside vcpkg, configure CMake with its installation prefix instead:
+Run from a normal interactive console:
 
 ```powershell
-cmake -S . -B build -DOPENSSL_ROOT_DIR="C:\path\to\OpenSSL"
-cmake --build build
+.\build\Release\pwm.exe --init
+.\build\Release\pwm.exe --create-pw "youtube"
 ```
 
-Run the executable:
+Account names must reach the program as UTF-8 bytes. If using a legacy Windows console code page, switch it to UTF-8 (for example, `chcp 65001`) before entering non-ASCII account names.
 
-```powershell
-.\build\Release\pwm.exe
-```
+The documented clean-machine Visual Studio/vcpkg setup has not been independently verified. The current development build and tests have been run with the available Windows toolchain.
 
-The Windows clipboard implementation is built into the executable. A normal interactive console is required for hidden master-password input.
+## Tests
 
-### Tests
+The CTest suite includes:
 
-Configure and build as above, then run the persistence tests with:
+- Credential create/read/update/delete and save/load round trips.
+- Authenticated-file tampering, truncated-file rejection, legacy migration, and vault reopening.
+- Wrong-master-password handling, failed-unlock cleanup, and vault-file tamper/truncation rejection.
+- Account/password validation edge cases: empty, overlong, control-character, malformed UTF-8, and embedded-NUL inputs.
+- Locked-vault rejection for reads, writes, updates, deletes, existence checks, and account listing.
+- Zeroization primitive and secure-container clear checks.
+- CLI rejection of `--show-pw`, empty account names, and unsupported options.
 
-```powershell
-ctest --test-dir build --output-on-failure
-```
+Run with `ctest --test-dir build --output-on-failure` (or add `-C Release` for a Visual Studio multi-configuration build).
 
-The current tests cover credential create/read/update/delete persistence, authenticated-file tampering, truncated files, legacy migration, vault reopening/tampering, unlock failure cleanup, and rejection of the obsolete cleartext-output option.
+## Data location and format
 
-### Linux
+On Windows, the application data directory is `%LOCALAPPDATA%\pwm`. It contains `vault.bin` (the encrypted vault-key envelope) and `credentials.dat` (encrypted records and integrity data). Do not edit these files manually. Keep an independent backup if needed; a backup does not bypass the master password.
 
-CMake contains Linux terminal-input and data-directory code, but Linux is **not currently a complete supported build target**: the clipboard backend is missing and the current executable references clipboard operations. A Linux clipboard backend and build validation are required before documenting Linux as supported.
+Linux terminal-input and data-directory code exists, but Linux is not a supported application target: the Windows clipboard backend is not available there, and a complete Linux build/run path has not been implemented or tested.
 
-## Data location
+## Security limitations
 
-The vault is stored in the current user's application-data directory:
+- PWM uses PBKDF2-HMAC-SHA-256 with a fixed 200,000 iterations; the initially considered Argon2id KDF is not implemented, and KDF parameters are not user-configurable.
+- Account names are visible in plaintext in the credential file. Passwords are encrypted.
+- The project has not received an independent security audit. The file format, migration paths, Windows ACL deployment assumptions, and cryptographic design have only been tested within the course project.
+- Clipboard access is shared with other desktop applications. Cleanup is conditional and best effort.
+- Removing files does not overwrite storage and cannot guarantee erasure from SSDs, backups, journals, snapshots, or filesystem caches.
+- A forgotten master password cannot be recovered.
 
-- **Windows:** `%LOCALAPPDATA%\pwm`
-- **Linux:** `~/.local/share/pwm`
-
-The implementation stores the vault key envelope in `vault.bin` and credential records in `credentials.dat`. These are application data files; do not edit them manually. Keep an independent backup if needed, noting that restoring files does not bypass the master password.
-
-## Typical use
-
-Initialize once:
-
-```text
-pwm --init
-```
-
-Use the account name by itself for the automatic behavior:
-
-```text
-pwm youtube
-```
-
-PWM prompts for the master password, then retrieves the existing `youtube` password to the clipboard. If the account is not in the vault, PWM creates and stores a new password, then copies it to the clipboard. Passwords are never printed.
-
-Create a generated password:
-
-```text
-pwm --create-pw "youtube"
-# Short alias:
-pwm -new "youtube"
-```
-
-Retrieve it to the clipboard:
-
-```text
-pwm --get-pw "youtube"
-# Short alias:
-pwm -get "youtube"
-```
-
-Passwords are never printed to the terminal. The old `--show-pw` option is rejected; retrieved and generated values are copied to the clipboard.
-
-Remove the local vault:
-
-```text
-pwm --uninstall
-```
-
-Uninstall asks for the master password and then requires typing `DELETE`. It removes vault files only; it does not uninstall the executable or securely erase disk sectors.
-
-## Security status and limitations
-
-This is a course project and an implementation under development, not an audited password manager. **Do not use it to protect real accounts or valuable secrets.**
-
-Important current limitations:
-
-1. The current design has not been independently security-audited. Although OpenSSL's cryptographic RNG is now used, the overall system still requires review.
-2. PBKDF2-HMAC-SHA-256 is implemented instead of the planned Argon2id. The iteration count and KDF parameters are currently fixed in code.
-3. Per-password AES-GCM authenticates each encrypted password, while a whole-file HMAC protects credential-file records and metadata against modification. Account names remain visible in plaintext. The vault-key file is versioned and its envelope authenticated with AES-GCM.
-4. The credential parser has size and structural checks, but the file format and migration logic still need broader testing and review.
-5. Key and plaintext zeroization is best-effort only with standard C++ containers. The clipboard is outside the vault's encryption boundary and may be visible to other applications.
-6. Deleting files is not equivalent to secure erasure and may leave recoverable copies in backups or filesystem/drive internals.
-
-### Remaining work beyond Checkpoint 2
-
-1. Decide whether to implement Argon2id with persisted KDF parameters or retain PBKDF2 with a documented security rationale.
-2. Independently review the cryptographic design, file formats, migration path, and error handling before considering use beyond a course prototype.
-3. Improve secure-memory handling and consider clipboard expiration that is safe and reliable after the CLI process exits.
-4. Complete and validate platform support, or explicitly restrict supported platforms to Windows until Linux clipboard behavior is implemented.
-5. Verify the documented Visual Studio/vcpkg build on a clean Windows machine.
-
-See [the short Checkpoint 2 progress note](./docs/checkpoint-2-progress.md) for the current deliverable summary.
+See the [Checkpoint 3 report draft](./docs/checkpoint-3-report.md) for the implementation summary and security analysis.
 
 ## Repository layout
 
 ```text
-include/                 Public declarations, secure-memory, and cryptographic-random helpers
+include/                 Public declarations, validation, logging, and secure-memory helpers
 src/
-  main.cpp               CLI parsing and command workflows
-  vault.cpp              Vault initialization, key derivation, wrapping, and lifecycle
-  credential.cpp         Credential encryption and file persistence
+  main.cpp               CLI parsing, workflows, and event logging
+  vault.cpp              Master-key derivation, vault lifecycle, and access checks
+  credential.cpp         Password encryption, validation, and persistence
   clipboard.cpp          Windows clipboard implementation
-  platform/              Platform-specific password input and data-directory helpers
-tests/                   Automated persistence tests
+  platform/              Platform-specific hidden input and data-directory helpers
+tests/                   Persistence, validation, memory, and access-control checks
+docs/                    Checkpoint notes and report draft
 ```

@@ -1,20 +1,23 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <stdexcept>
 #include "credential.hpp"
+#include "secure_memory.hpp"
 
 namespace pwm {
 
 class Vault {
 public:
     Vault();
+    ~Vault();
     
-    void initialize(const std::string& masterPassword);
-    void deleteVault(const std::string& masterPassword);
-    bool validatePassword(const std::string& masterPassword) const;
-    void unlock(const std::string& masterPassword);
+    void initialize(std::string_view masterPassword);
+    void deleteVault(std::string_view masterPassword);
+    bool validatePassword(std::string_view masterPassword) const;
+    void unlock(std::string_view masterPassword);
     void lock();
     bool isInitialized() const;
     bool isUnlocked() const;
@@ -23,11 +26,11 @@ public:
     const std::string& getDataDirectory() const { return dataDirectory; }
     
     // Credential management
-    void storeCredential(const std::string& accountName, const std::string& password);
-    std::string retrieveCredential(const std::string& accountName) const;
-    void updateCredential(const std::string& accountName, const std::string& newPassword);
-    void deleteCredential(const std::string& accountName);
-    bool credentialExists(const std::string& accountName) const;
+    void storeCredential(std::string_view accountName, std::string_view password);
+    SecureString retrieveCredential(std::string_view accountName) const;
+    void updateCredential(std::string_view accountName, std::string_view newPassword);
+    void deleteCredential(std::string_view accountName);
+    bool credentialExists(std::string_view accountName) const;
     std::vector<std::string> listAccounts() const;
 
 private:
@@ -36,16 +39,17 @@ private:
     std::string credentialsPath;
     std::vector<unsigned char> salt;
     std::vector<unsigned char> encryptedMasterKey;
-    std::vector<unsigned char> vaultKey;
+    SecureBuffer vaultKey;
     bool initialized = false;
     bool unlocked = false;
     mutable CredentialManager credentialManager;
     
     void generateSalt();
-    std::vector<unsigned char> deriveKey(const std::string& password, const std::vector<unsigned char>& salt) const;
+    SecureBuffer deriveKey(std::string_view password,
+                           const std::vector<unsigned char>& salt) const;
     void generateVaultKey();
-    std::vector<unsigned char> loadVaultKey(const std::string& masterPassword) const;
-    void saveVaultKey(const std::string& masterPassword, const std::vector<unsigned char>& keyToStore) const;
+    SecureBuffer loadVaultKey(std::string_view masterPassword) const;
+    void saveVaultKey(std::string_view masterPassword, const SecureBuffer& keyToStore) const;
     void createVaultDirectory() const;
     void loadCredentials() const;
     void saveCredentials() const;

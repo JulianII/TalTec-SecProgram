@@ -1,6 +1,8 @@
 #include "vault.hpp"
 #include "crypto_random.hpp"
+#include "input_validation.hpp"
 #include "platform/platform.hpp"
+#include "secure_memory.hpp"
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -22,6 +24,11 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+class AuthenticationError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 constexpr std::array<unsigned char, 8> vaultFileMagic = {
     'P', 'W', 'M', 'V', 'L', 'T', '0', '2'
@@ -137,8 +144,8 @@ void writeVaultFileAtomically(
 }
 
 std::vector<unsigned char> encryptWithAesGcm(
-    const std::vector<unsigned char>& key,
-    const std::vector<unsigned char>& plaintext,
+    const pwm::SecureBuffer& key,
+    const pwm::SecureBuffer& plaintext,
     const std::vector<unsigned char>& nonce,
     std::vector<unsigned char>& tagOut) {
     if (key.size() != 32) {
@@ -181,8 +188,8 @@ std::vector<unsigned char> encryptWithAesGcm(
     }
 }
 
-std::vector<unsigned char> decryptWithAesGcm(
-    const std::vector<unsigned char>& key,
+pwm::SecureBuffer decryptWithAesGcm(
+    const pwm::SecureBuffer& key,
     const std::vector<unsigned char>& nonce,
     const std::vector<unsigned char>& ciphertextAndTag) {
     if (key.size() != 32) {
@@ -197,7 +204,7 @@ std::vector<unsigned char> decryptWithAesGcm(
 
     std::vector<unsigned char> tag(ciphertextAndTag.end() - 16, ciphertextAndTag.end());
     std::vector<unsigned char> ciphertext(ciphertextAndTag.begin(), ciphertextAndTag.end() - 16);
-    std::vector<unsigned char> plaintext(ciphertext.size() + 16, 0);
+    pwm::SecureBuffer plaintext(ciphertext.size() + 16);
     int outLen1 = 0;
     int outLen2 = 0;
 
@@ -211,9 +218,11 @@ std::vector<unsigned char> decryptWithAesGcm(
             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce.size()), nullptr) != 1 ||
             EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1 ||
             EVP_DecryptUpdate(ctx, plaintext.data(), &outLen1, ciphertext.data(), static_cast<int>(ciphertext.size())) != 1 ||
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag.data()) != 1 ||
-            EVP_DecryptFinal_ex(ctx, plaintext.data() + outLen1, &outLen2) != 1) {
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag.data()) != 1) {
             throw std::runtime_error("Failed to decrypt vault key");
+        }
+        if (EVP_DecryptFinal_ex(ctx, plaintext.data() + outLen1, &outLen2) != 1) {
+            throw AuthenticationError("Invalid master password or vault data");
         }
 
         plaintext.resize(static_cast<size_t>(outLen1 + outLen2));
@@ -233,15 +242,21 @@ Vault::Vault() : dataDirectory(platform::getUserDataDirectory()),
                  vaultPath(dataDirectory + "/vault.bin"),
                  credentialsPath(dataDirectory + "/credentials.dat") {}
 
+Vault::~Vault() {
+    credentialManager.clearKey();
+    vaultKey.clear();
+    unlocked = false;
+}
+
 void Vault::generateSalt() {
     salt = crypto::randomBytes(16);
 }
 
-std::vector<unsigned char> Vault::deriveKey(const std::string& password, const std::vector<unsigned char>& saltBytes) const {
-    if (password.size() > static_cast<size_t>(INT_MAX)) {
-        throw std::runtime_error("Master password is too long");
-    }
-    std::vector<unsigned char> key(32, 0);
+SecureBuffer Vault::deriveKey(
+    std::string_view password,
+    const std::vector<unsigned char>& saltBytes) const {
+    validateSecret(password, "Master password");
+    SecureBuffer key(32);
     if (PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
         saltBytes.data(), static_cast<int>(saltBytes.size()),
         200000, EVP_sha256(), static_cast<int>(key.size()), key.data()) != 1) {
@@ -251,7 +266,7 @@ std::vector<unsigned char> Vault::deriveKey(const std::string& password, const s
 }
 
 void Vault::generateVaultKey() {
-    vaultKey = crypto::randomBytes(32);
+    vaultKey = crypto::randomSecureBytes(32);
 }
 
 void Vault::createVaultDirectory() const {
@@ -260,7 +275,7 @@ void Vault::createVaultDirectory() const {
     }
 }
 
-std::vector<unsigned char> Vault::loadVaultKey(const std::string& masterPassword) const {
+SecureBuffer Vault::loadVaultKey(std::string_view masterPassword) const {
     const auto bytes = readVaultFile(vaultPath);
     size_t offset = 0;
     std::vector<unsigned char> saltRead(vaultSaltSize);
@@ -303,7 +318,9 @@ std::vector<unsigned char> Vault::loadVaultKey(const std::string& masterPassword
     return decryptWithAesGcm(derivedKey, nonce, encryptedKeyAndTag);
 }
 
-void Vault::saveVaultKey(const std::string& masterPassword, const std::vector<unsigned char>& keyToStore) const {
+void Vault::saveVaultKey(
+    std::string_view masterPassword,
+    const SecureBuffer& keyToStore) const {
     const auto derivedKey = deriveKey(masterPassword, salt);
     const auto nonce = crypto::randomBytes(12);
     std::vector<unsigned char> tag;
@@ -317,18 +334,26 @@ void Vault::saveVaultKey(const std::string& masterPassword, const std::vector<un
     writeVaultFileAtomically(vaultPath, bytes);
 }
 
-void Vault::initialize(const std::string& masterPassword) {
+void Vault::initialize(std::string_view masterPassword) {
+    validateSecret(masterPassword, "Master password");
     createVaultDirectory();
     generateSalt();
     generateVaultKey();
-    saveVaultKey(masterPassword, vaultKey);
+    try {
+        saveVaultKey(masterPassword, vaultKey);
+    } catch (...) {
+        vaultKey.clear();
+        salt.clear();
+        throw;
+    }
 
     initialized = true;
     unlocked = false;
     credentialManager.clearKey();
 }
 
-void Vault::deleteVault(const std::string& masterPassword) {
+void Vault::deleteVault(std::string_view masterPassword) {
+    validateSecret(masterPassword, "Master password");
     if (!isInitialized()) {
         throw std::runtime_error("Vault is not initialized");
     }
@@ -337,7 +362,6 @@ void Vault::deleteVault(const std::string& masterPassword) {
     }
 
     credentialManager.clearKey();
-    std::fill(vaultKey.begin(), vaultKey.end(), 0);
     vaultKey.clear();
     unlocked = false;
 
@@ -360,7 +384,7 @@ void Vault::deleteVault(const std::string& masterPassword) {
     initialized = false;
 }
 
-bool Vault::validatePassword(const std::string& masterPassword) const {
+bool Vault::validatePassword(std::string_view masterPassword) const {
     if (!isInitialized()) {
         return false;
     }
@@ -368,7 +392,7 @@ bool Vault::validatePassword(const std::string& masterPassword) const {
     try {
         const auto loadedKey = loadVaultKey(masterPassword);
         return loadedKey.size() == 32;
-    } catch (...) {
+    } catch (const AuthenticationError&) {
         return false;
     }
 }
@@ -381,19 +405,24 @@ bool Vault::isUnlocked() const {
     return unlocked;
 }
 
-void Vault::unlock(const std::string& masterPassword) {
-    if (!validatePassword(masterPassword)) {
+void Vault::unlock(std::string_view masterPassword) {
+    validateSecret(masterPassword, "Master password");
+    if (!isInitialized()) {
+        throw std::runtime_error("Vault is not initialized");
+    }
+
+    try {
+        vaultKey = loadVaultKey(masterPassword);
+    } catch (const AuthenticationError&) {
         throw std::runtime_error("Invalid password");
     }
 
-    vaultKey = loadVaultKey(masterPassword);
     credentialManager.setKey(vaultKey);
     try {
         loadCredentials();
         unlocked = true;
     } catch (...) {
         credentialManager.clearKey();
-        std::fill(vaultKey.begin(), vaultKey.end(), 0);
         vaultKey.clear();
         throw;
     }
@@ -404,9 +433,15 @@ void Vault::lock() {
         return;
     }
 
-    saveCredentials();
+    try {
+        saveCredentials();
+    } catch (...) {
+        credentialManager.clearKey();
+        vaultKey.clear();
+        unlocked = false;
+        throw;
+    }
     credentialManager.clearKey();
-    std::fill(vaultKey.begin(), vaultKey.end(), 0);
     vaultKey.clear();
     unlocked = false;
 }
@@ -422,7 +457,7 @@ void Vault::saveCredentials() const {
     credentialManager.saveToFile(credentialsPath);
 }
 
-void Vault::storeCredential(const std::string& accountName, const std::string& password) {
+void Vault::storeCredential(std::string_view accountName, std::string_view password) {
     if (!isUnlocked()) {
         throw std::runtime_error("Vault is locked");
     }
@@ -431,7 +466,7 @@ void Vault::storeCredential(const std::string& accountName, const std::string& p
     saveCredentials();
 }
 
-std::string Vault::retrieveCredential(const std::string& accountName) const {
+SecureString Vault::retrieveCredential(std::string_view accountName) const {
     if (!isUnlocked()) {
         throw std::runtime_error("Vault is locked");
     }
@@ -440,7 +475,9 @@ std::string Vault::retrieveCredential(const std::string& accountName) const {
     return credentialManager.decrypt(cred.encryptedPassword, cred.nonce);
 }
 
-void Vault::updateCredential(const std::string& accountName, const std::string& newPassword) {
+void Vault::updateCredential(
+    std::string_view accountName,
+    std::string_view newPassword) {
     if (!isUnlocked()) {
         throw std::runtime_error("Vault is locked");
     }
@@ -449,7 +486,7 @@ void Vault::updateCredential(const std::string& accountName, const std::string& 
     saveCredentials();
 }
 
-void Vault::deleteCredential(const std::string& accountName) {
+void Vault::deleteCredential(std::string_view accountName) {
     if (!isUnlocked()) {
         throw std::runtime_error("Vault is locked");
     }
@@ -458,9 +495,9 @@ void Vault::deleteCredential(const std::string& accountName) {
     saveCredentials();
 }
 
-bool Vault::credentialExists(const std::string& accountName) const {
+bool Vault::credentialExists(std::string_view accountName) const {
     if (!isUnlocked()) {
-        return false;
+        throw std::runtime_error("Vault is locked");
     }
     credentialManager.setKey(vaultKey);
     return credentialManager.exists(accountName);
@@ -468,7 +505,7 @@ bool Vault::credentialExists(const std::string& accountName) const {
 
 std::vector<std::string> Vault::listAccounts() const {
     if (!isUnlocked()) {
-        return {};
+        throw std::runtime_error("Vault is locked");
     }
     credentialManager.setKey(vaultKey);
     return credentialManager.listAccounts();

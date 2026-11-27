@@ -1,8 +1,10 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ctime>
+#include "secure_memory.hpp"
 
 namespace pwm {
 
@@ -17,26 +19,29 @@ struct Credential {
 class CredentialManager {
 public:
     void setKey(const std::vector<unsigned char>& key);
+    void setKey(const SecureBuffer& key);
     void clearKey();
 
-    void storeCredential(const std::string& accountName, const std::string& password);
-    Credential retrieveCredential(const std::string& accountName) const;
-    void updateCredential(const std::string& accountName, const std::string& newPassword);
-    void deleteCredential(const std::string& accountName);
-    bool exists(const std::string& accountName) const;
+    void storeCredential(std::string_view accountName, std::string_view password);
+    Credential retrieveCredential(std::string_view accountName) const;
+    void updateCredential(std::string_view accountName, std::string_view newPassword);
+    void deleteCredential(std::string_view accountName);
+    bool exists(std::string_view accountName) const;
     std::vector<std::string> listAccounts() const;
     
     void saveToFile(const std::string& filepath) const;
     void loadFromFile(const std::string& filepath);
     
     // For Vault class to access
-    std::string decrypt(const std::vector<unsigned char>& ciphertext, const std::vector<unsigned char>& nonce) const;
+    SecureString decrypt(const std::vector<unsigned char>& ciphertext,
+                         const std::vector<unsigned char>& nonce) const;
 
 private:
     std::vector<Credential> credentials;
-    std::vector<unsigned char> encryptionKey;
+    SecureBuffer encryptionKey;
     
-    std::vector<unsigned char> encrypt(const std::string& plaintext, const std::vector<unsigned char>& nonce) const;
+    std::vector<unsigned char> encrypt(std::string_view plaintext,
+                                       const std::vector<unsigned char>& nonce) const;
     std::vector<unsigned char> generateNonce() const;
 };
 

@@ -50,4 +50,14 @@ if(BUILD_TESTING)
         COMMAND pwm --get-pw sample-account --show-pw
     )
     set_tests_properties(show_password_option_rejected PROPERTIES WILL_FAIL TRUE)
+
+    add_test(NAME empty_account_rejected
+        COMMAND pwm --get-pw ""
+    )
+    set_tests_properties(empty_account_rejected PROPERTIES WILL_FAIL TRUE)
+
+    add_test(NAME unsupported_option_rejected
+        COMMAND pwm --init --unsupported
+    )
+    set_tests_properties(unsupported_option_rejected PROPERTIES WILL_FAIL TRUE)
 endif()
